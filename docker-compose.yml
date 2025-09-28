@@ -1,0 +1,192 @@
+version: '3.9'
+
+services:
+  # Redis for caching and temporary state
+  redis:
+    image: redis:7-alpine
+    container_name: poc-redis
+    ports:
+      - "16379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - poc_network
+    restart: unless-stopped
+
+  # ChromaDB for vector storage and RAG
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: poc-chromadb
+    environment:
+      CHROMA_SERVER_HOST: 0.0.0.0
+      CHROMA_SERVER_HTTP_PORT: 8000
+      CHROMA_SERVER_CORS_ALLOW_ORIGINS: "*"
+      ANONYMIZED_TELEMETRY: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/heartbeat || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - poc_network
+    restart: unless-stopped
+
+  # Ollama Service
+  ollama:
+    image: ollama/ollama:latest
+    container_name: poc-ollama
+
+    # GPU support for Ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+        limits:
+          memory: 32G
+
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_ORIGINS=*
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_DEBUG=1
+
+    ports:
+      - "11434:11434"
+
+    volumes:
+      - /mnt/secure/.ollama:/root/.ollama
+
+    # Health check using process and port check
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f ollama || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 8
+
+    restart: unless-stopped
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+    networks:
+      - poc_network
+
+  # Ollama Model Initialization
+  ollama-init:
+    image: curlimages/curl:latest
+    container_name: poc-ollama-init
+
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo 'Ollama is healthy, starting model initialization...'
+        sleep 5
+
+        # Function to pull and verify a model
+        pull_model() {
+          MODEL_NAME="$$1"
+          echo "Checking if model $$MODEL_NAME exists..."
+
+          if ! curl -s --max-time 10 http://ollama:11434/api/tags | grep -q "$$MODEL_NAME"; then
+            echo "Model $$MODEL_NAME not found. Pulling..."
+
+            # Pull the model
+            curl -X POST http://ollama:11434/api/pull \
+              -H 'Content-Type: application/json' \
+              -d "{\"name\": \"$$MODEL_NAME\"}" \
+              --max-time 7200
+
+            if [ $$? -eq 0 ]; then
+              echo "Model $$MODEL_NAME pull completed"
+
+              # Wait for model to be available
+              for i in {1..30}; do
+                if curl -s http://ollama:11434/api/tags | grep -q "$$MODEL_NAME"; then
+                  echo "Model $$MODEL_NAME successfully loaded"
+
+                  # Test the model
+                  echo "Testing model $$MODEL_NAME..."
+                  if curl -X POST http://ollama:11434/api/generate \
+                    -H 'Content-Type: application/json' \
+                    -d "{\"model\": \"$$MODEL_NAME\", \"prompt\": \"Hello\", \"stream\": false}" \
+                    --max-time 120 | grep -q '"response"'; then
+                    echo "Model $$MODEL_NAME test successful!"
+                  else
+                    echo "Model $$MODEL_NAME test failed"
+                  fi
+                  break
+                fi
+                echo "Waiting for model $$MODEL_NAME... attempt $$i/30"
+                sleep 10
+              done
+            else
+              echo "Model $$MODEL_NAME pull failed"
+              return 1
+            fi
+          else
+            echo "Model $$MODEL_NAME already exists"
+
+            # Test existing model
+            echo "Testing existing model $$MODEL_NAME..."
+            if curl -X POST http://ollama:11434/api/generate \
+              -H 'Content-Type: application/json' \
+              -d "{\"model\": \"$$MODEL_NAME\", \"prompt\": \"Hi\", \"stream\": false}" \
+              --max-time 120 | grep -q '"response"'; then
+              echo "Model $$MODEL_NAME test successful!"
+            else
+              echo "Model $$MODEL_NAME exists but test failed"
+            fi
+          fi
+        }
+
+        # Pull all required models
+        echo "Starting model pulls..."
+        pull_model "gpt-oss:120b"
+
+        echo "All models initialization complete!"
+
+    restart: "no"
+
+    networks:
+      - poc_network
+
+volumes:
+  redis_data:
+    driver: local
+  chromadb_data:
+    driver: local
+  ollama_data:
+    driver: local
+
+networks:
+  poc_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
