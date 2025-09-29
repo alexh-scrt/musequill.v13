@@ -18,6 +18,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.agents.generator import GeneratorAgent
 from src.agents.discriminator import DiscriminatorAgent
+from src.agents.evaluator import EvaluatorAgent
 from src.agents.profiles import GeneratorProfileFactory, DiscriminatorProfileFactory
 
 from src.server.models import AgentResponse
@@ -48,6 +49,15 @@ class WorkflowOrchestrator:
         self.discriminator = DiscriminatorAgent(
             session_id=self.session_id, 
             llm_params=disc_params)        
+
+        self.generator_evaluator = EvaluatorAgent(
+            session_id=self.session_id
+        )
+
+        self.discriminator_evaluator = EvaluatorAgent(
+            session_id=self.session_id
+        )
+
         self.graph = None
         self.compiled_graph = None
         
@@ -102,11 +112,18 @@ class WorkflowOrchestrator:
         
         # Planning phase edges
         workflow.add_edge(START, "generator")
-        workflow.add_edge("generator", "discriminator")
+        workflow.add_edge("generator", "generator_evaluator")
         workflow.add_conditional_edges(
-            "discriminator",
-            self._should_stop
+            "generator_evaluator",
+            self._should_revise_generator
         )
+        workflow.add_edge("discriminator", "discriminator_evaluator")
+        workflow.add_conditional_edges(
+            "discriminator_evaluator",
+            self._should_revise_discriminator
+        )
+        workflow.add_edge("discriminator_evaluator", "summarizer")
+        workflow.add_edge("summarizer", END)
         
         # Compile with memory
         memory = MemorySaver()
