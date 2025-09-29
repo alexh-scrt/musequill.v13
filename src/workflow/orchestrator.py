@@ -19,6 +19,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from src.agents.generator import GeneratorAgent
 from src.agents.discriminator import DiscriminatorAgent
 from src.agents.evaluator import EvaluatorAgent
+from src.agents.summarizer import SummarizerAgent
 from src.agents.profiles import GeneratorProfileFactory, DiscriminatorProfileFactory
 
 from src.server.models import AgentResponse
@@ -56,6 +57,11 @@ class WorkflowOrchestrator:
 
         self.discriminator_evaluator = EvaluatorAgent(
             session_id=self.session_id
+        )
+
+        self.summarizer = SummarizerAgent(
+            session_id=self.session_id,
+            llm_params={'temperature': 0.3}  # Lower temp for consistency
         )
 
         self.graph = None
@@ -109,7 +115,8 @@ class WorkflowOrchestrator:
         # Phase 1: Planning nodes
         workflow.add_node("generator", self._generator_node)
         workflow.add_node("discriminator", self._discriminator_node)
-        
+        workflow.add_node("summarizer", self._summarizer_node)  # NEW NODE
+
         # Planning phase edges
         workflow.add_edge(START, "generator")
         workflow.add_edge("generator", "generator_evaluator")
@@ -124,7 +131,7 @@ class WorkflowOrchestrator:
         )
         workflow.add_edge("discriminator_evaluator", "summarizer")
         workflow.add_edge("summarizer", END)
-        
+
         # Compile with memory
         memory = MemorySaver()
         self.compiled_graph = workflow.compile(checkpointer=memory)
@@ -138,6 +145,34 @@ class WorkflowOrchestrator:
             logger.warning(f"⚠️ Maximum iterations {MAX_ITERATIONS} reached in WorkflowOrchestrator")
             return END
         return "generator"
+
+    async def _summarizer_node(self, state: TopicFocusedState) -> dict:
+        """Generate comprehensive summary and quality assessment"""
+        logger.info("📊 SUMMARIZER")
+        logger.info(f"📊 Generating final summary for session {self.session_id}")
+        
+        try:
+            summary, state_updates = await self.summarizer.process(state=state)
+            
+            # Log the summary
+            self._log_queue.put_nowait({
+                "agent_id": "summarizer",
+                "content": summary
+            })
+            
+            return {
+                **state_updates,
+                "current_response": summary,
+                "END": True
+            }
+        except Exception as e:
+            logger.error(f"Error in summarizer node: {e}", exc_info=True)
+            return {
+                "current_response": f"Error generating summary: {str(e)}",
+                "END": True
+            }
+
+
 
     # ====================
     # Planning Phase Nodes
