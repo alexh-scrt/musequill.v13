@@ -13,7 +13,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.agents.generator import GeneratorAgent
@@ -22,55 +22,11 @@ from src.agents.profiles import GeneratorProfileFactory, DiscriminatorProfileFac
 
 from src.server.models import AgentResponse
 from src.storage.chroma_manager import ChromaManager
-
+from src.states.topic_focused import TopicFocusedState
 logger = logging.getLogger(__name__)
 
 
-class OrchestratorState(TypedDict):
-    """Clean state schema for the orchestrated workflow"""
-    # Core fields
-    topic: str
-    phase: str  # "generator", "discriminator"
-    messages: Annotated[list, add_messages]
-    
-    # Content fields
-    current_content: str
-    writer_blueprint: str
-    
-    # Iteration tracking
-    iteration: Annotated[int, operator.add]
-    phase_iteration: Annotated[int, operator.add]
-    max_iterations: int
-    
-    # Quality tracking
-    quality_scores: Dict[str, float]
-    overall_quality: float
-    quality_threshold: float
-    quality_met: bool
-    evaluation_summary: str
-    
-    # Revision tracking
-    planning_revisions: List[Dict[str, Any]]
-    writing_revisions: List[Dict[str, Any]]
-    best_blueprint: str
-    best_content: str
-    
-    # Chapter expansion
-    chapters_parsed: List[Dict[str, Any]]
-    current_chapter_index: int
-    current_chapter_content: str
-    chapter_iterations: List[Dict[str, Any]]
-    expanded_chapters: List[Dict[str, Any]]
-    has_more_chapters: bool
-    
-    # Final outputs
-    final_book: str
-    book_filepath: str
-    log_filepath: str
-    
-    # Research materials from planner
-    research_materials: List[Dict[str, Any]]
-
+MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "25"))
 
 class WorkflowOrchestrator:
     """Orchestrate collaboration between agents using clean LangGraph architecture"""
@@ -138,7 +94,7 @@ class WorkflowOrchestrator:
     
     def _build_graph(self):
         """Build the clean workflow graph with explicit phase transitions"""
-        workflow = StateGraph(OrchestratorState)
+        workflow = StateGraph(TopicFocusedState)
         
         # Phase 1: Planning nodes
         workflow.add_node("generator", self._generator_node)
@@ -149,7 +105,7 @@ class WorkflowOrchestrator:
         workflow.add_edge("generator", "discriminator")
         workflow.add_conditional_edges(
             "discriminator",
-            lambda s: END if s.get("END") else "generator"
+            self._should_stop
         )
         
         # Compile with memory
@@ -157,49 +113,55 @@ class WorkflowOrchestrator:
         self.compiled_graph = workflow.compile(checkpointer=memory)
         logger.info("✅ Workflow graph compiled successfully")
     
+
+    def _should_stop(self, state: TopicFocusedState) -> str:
+        if state.get("END") or state.get("STOP"):
+            return END
+        if state.get("iterations", 0) >= MAX_ITERATIONS:
+            logger.warning(f"⚠️ Maximum iterations {MAX_ITERATIONS} reached in WorkflowOrchestrator")
+            return END
+        return "generator"
+
     # ====================
     # Planning Phase Nodes
     # ====================
     
-    async def _generator_node(self, state: OrchestratorState) -> dict:
+    async def _generator_node(self, state: TopicFocusedState) -> dict:
         logger.info("📋  GENERATOR")
-        phase_iteration = state.get("phase_iteration", 0)
-        logger.info(f"📋  GENERATOR iteration {phase_iteration + 1}")
+        iteration = state.get("iterations", 0)
+        logger.info(f"📋  GENERATOR iteration {iteration + 1}")
         
-        topic = state.get("topic", "")
-        messages = state.get("messages", [])
+        original_topic = state.get("original_topic", "")
+        current_depth_level = state.get("current_depth_level", 1)
+        aspects_explored = state.get("aspects_explored", [])
+        topic_summary = state.get("topic_summary", "")
+        last_followup_question = state.get("last_followup_question", "")
         
-        user_prompt = topic
-        if messages:
-            last_msg = messages[-1]
-            if isinstance(last_msg, AIMessage) and last_msg.name == "discriminator":
-                user_prompt = last_msg.content
+        user_prompt = last_followup_question if last_followup_question else original_topic
         
-        response = await self.generator.process(user_prompt)
+        response, state_updates = await self.generator.process(user_prompt, state=state)
         
         return {
-            "current_content": response,
-            "iteration": 1,
-            "phase_iteration": 1,
-            "messages": [AIMessage(content=response, name="generator")]
+            **state_updates,
+            "current_response": response,
+            "iterations": iteration
         }
 
 
-    async def _discriminator_node(self, state: OrchestratorState) -> dict:
+    async def _discriminator_node(self, state: TopicFocusedState) -> dict:
         logger.info("📋  DISCRIMINATOR")
-        phase_iteration = state.get("phase_iteration", 0)
-        logger.info(f"📋  DISCRIMINATOR iteration {phase_iteration + 1}")
+        iteration = state.get("iterations", 0)
+        logger.info(f"📋  DISCRIMINATOR iteration {iteration + 1}")
         
-        generator_response = state.get("current_content", "")
-        response = await self.discriminator.process(generator_response)
+        generator_response = state.get("current_response", "")
+        response, state_updates = await self.discriminator.process(generator_response, state)
         
         should_end = "STOP" in response.upper()
         
         return {
-            "current_content": response,
-            "iteration": 1,
-            "phase_iteration": 1,
-            "messages": [AIMessage(content=response, name="discriminator")],
+            **state_updates,
+            "current_response": response,
+            "iterations": iteration + 1,
             "END": should_end
         }
     
@@ -214,19 +176,16 @@ class WorkflowOrchestrator:
         logger.info(f"🚀 Starting orchestrated workflow for: {topic}")
         logger.info(f"Config: max_iterations={max_iterations}, threshold={quality_threshold}")
         
-        initial_state = {
-            "topic": topic,
-            "current_content": "",
-            "iteration": 0,
-            "max_iterations": max_iterations,
-            "quality_scores": {},
-            "overall_quality": 0.0,
-            "quality_threshold": quality_threshold,
-            "quality_met": False,
-            "evaluation_summary": "",
-            "log_filepath": "",
-            "research_materials": []
-        }
+        state = TopicFocusedState(
+            original_topic=topic,
+            current_depth_level=1,
+            aspects_explored=[],
+            topic_summary="",
+            last_followup_question="",
+            iterations=0,
+            current_response=""
+        )
+ 
         
         self._log_task = asyncio.create_task(self._log_worker())
         self._log_queue.put_nowait({
@@ -244,7 +203,7 @@ class WorkflowOrchestrator:
             # Stream events from the graph and capture final state
             final_state = None
             async for event in self.compiled_graph.astream_events(
-                initial_state,
+                state,
                 config=config,
                 version="v2"
             ):
@@ -260,9 +219,7 @@ class WorkflowOrchestrator:
                 if event_kind == "on_chain_start" and event_name in [
                     "generator"
                 ]:
-                    phase = event_data.get("input", {}).get("phase", "")
-                    iteration = event_data.get("input", {}).get("iteration", 0)
-                    
+                    pass
                     # # Generate appropriate message
                     # if "generator" in event_name:
                     #     message = f"⚙️ Processing {event_name}..."
@@ -279,9 +236,9 @@ class WorkflowOrchestrator:
                     # )
                 
                 # Handle completion
-                elif event_kind == "on_chain_end" and event_name in ["generator", "discriminator"]:
+                if event_kind == "on_chain_end" and event_name in ["generator", "discriminator"]:
                     output = event_data.get("output", {})
-                    content = output.get("current_content", output.get("current_chapter_content", ""))
+                    content = output.get("current_response", "")
                     
                     if content:
                         self._log_queue.put_nowait({
@@ -301,7 +258,7 @@ class WorkflowOrchestrator:
             
             # Use captured final state or fallback to initial state
             if not final_state:
-                final_state = initial_state
+                final_state = state
             
             # Send final summary
             final_summary = final_state.get("messages", [])[-1].content if final_state.get("messages") else "Workflow complete"

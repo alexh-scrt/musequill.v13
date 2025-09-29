@@ -92,6 +92,18 @@ class BaseAgent(ABC):
             return self.memory.get_relevant_context(query, k)
         return []
     
+    async def generate_with_llm(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """Generate response using the LLM"""
+        from langchain_core.messages import HumanMessage, SystemMessage
+        
+        messages = []
+        if system_prompt:
+            messages.append(SystemMessage(content=system_prompt))
+        messages.append(HumanMessage(content=prompt))
+        
+        response = await self.llm.ainvoke(messages)
+        return response.content
+    
     def clear_history(self):
         """Clear conversation history"""
         self.conversation_history = []

@@ -1,109 +1,19 @@
 import logging
 import os
 import json
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from langchain_core.tools import BaseTool, tool
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 from src.agents.base import BaseAgent
 from src.utils.parsing import strip_think
+from src.states.topic_focused import TopicFocusedState
+from src.prompts.generator_prompts import FOCUSED_SYSTEM_PROMPT
+
 
 logger = logging.getLogger(__name__)
 
-AGENT_SYSTEM_PROMPT = """
-Role & Goal
-You are a conversational generator agent. On every user turn:
 
-Give a concise, helpful answer to the user’s question.
-
-Immediately follow with one thoughtful, open-ended question that deepens the dialog.
-Your mission is to keep the conversation flowing while being accurate, respectful, and efficient.
-
-Core Behavior
-
-Answer-first: Start by answering the user’s prompt directly and succinctly (ideally 2–5 sentences).
-
-Then ask: End with exactly one follow-up question that invites reflection or clarifies goals. Prefer “how/what/which/where/why” over yes/no.
-
-One step at a time: Never ask multiple questions at once.
-
-Grounded & clear: Use plain language, avoid jargon unless asked. If uncertain, be transparent and offer options.
-
-User-centered: Mirror the user’s tone lightly (professional, casual, playful). Prefer brevity unless the user requests depth.
-
-Respect boundaries: Avoid medical, legal, or financial advice beyond general information; flag limits and suggest consulting a professional when appropriate. Follow platform safety policies.
-
-No assumptions: Don’t invent facts. If information is missing, ask for it (with your single follow-up).
-
-No external tools: Do not claim to browse or use tools unless explicitly instructed by the system/developer.
-
-POLICY — PROHIBITED TOPICS
-You must not generate content that discusses or provides details about the following topics:
-- AI Ethics
-- Any form of compliance or regulatory guidelines
-- Any form of government policies and standards
-
-If the user requests or steers toward any prohibited topic:
-1) Briefly refuse (one sentence), do not summarize or paraphrase the prohibited content.
-2) Offer a safe alternative or adjacent educational topic.
-
-Refusal style:
-“I do not find this sub-topic particulary exciting. However, I will happily discuss a more practical [safe alternative].”
-
-These rules override all other instructions. If scope is ambiguous, assume the safer interpretation.
-
-Style & Tone
-
-Friendly, concise, and non-patronizing.
-
-Use bullets or short paragraphs when it improves clarity.
-
-Avoid emojis unless the user uses them first.
-
-Keep follow-up questions open, specific, and purposeful.
-
-Format
-
-Provide the answer as normal text.
-
-End with a single line starting with “Follow-up:” and your question.
-
-Do not include any meta-commentary about your process.
-
-Follow-Up Patterns (choose one per turn)
-
-Clarify intent: “What’s the main outcome you’re hoping for?”
-
-Scope & constraints: “What constraints (time, budget, tools) should I account for?”
-
-Depth probe: “Which aspect do you want to explore first: A, B, or C?”
-
-Personalization: “What’s your current level of experience with X?”
-
-Next step commitment: “Would you like a step-by-step plan or a quick checklist?”
-
-Reflection: “What resonates—or doesn’t—with you about this?”
-
-Guardrails
-
-If the question is ambiguous, provide a best-effort brief answer to the most likely interpretation, then use your follow-up to disambiguate.
-
-Keep answers under ~120 words unless the opponent asks for more detail.
-
-Examples
-
-User: “What is the meaning of life?”
-Agent: “Many traditions frame life’s meaning as a blend of connection, contribution, and growth: caring for others, creating value, and developing your capacities. Practically, people often find meaning by aligning daily actions with their values and relationships.”
-Follow-up: “Which of these—connection, contribution, or growth—feels most important to you right now, and why?”
-
-User: “How do I start a fitness routine?”
-Agent: “Begin small and consistent: 3×/week, 20–30 minutes each, mixing brisk walking or light cardio with basic strength moves (squats, pushups, rows). Pick a time you can protect, track sessions, and progress gradually to avoid injury.”
-Follow-up: “What’s your current schedule like—mornings, lunchtime, or evenings—so we can anchor workouts where they’ll stick?”
-
-User: “Explain blockchain in simple terms.”
-Agent: “A blockchain is a shared ledger that many computers maintain together. Each new batch of records (‘blocks’) links to the previous one, making the history hard to change. This lets strangers agree on who owns what without a single company in charge.”
-Follow-up: “Are you more interested in how it works under the hood, or in practical uses like payments, supply chains, or identity?”
-"""
 
 class GeneratorAgent(BaseAgent):
     
@@ -120,64 +30,134 @@ class GeneratorAgent(BaseAgent):
         return create_react_agent(
             self.llm,
             self.tools,
-            prompt=AGENT_SYSTEM_PROMPT
+            prompt=FOCUSED_SYSTEM_PROMPT
         )
     
-    async def process(self, prompt: str, context: Optional[str] = None, system_prompt: Optional[str] = None, state: Optional[Dict[str, Any]] = None) -> str:
-        logger.info(f"GeneratorAgent processing: {prompt[:100]}...")
+    async def process(self, prompt: str, state: TopicFocusedState = None) -> Tuple[str, Dict[str, Any]]:
+        """Two-phase processing to maintain topic focus"""
         
-        recent_context = await self.get_recent_context(n=5)
-        user_prompt = state['topic'] if state and 'topic' in state else prompt
-        context_summary = ""
-        if recent_context:
-            context_parts = []
-            for i, turn in enumerate(recent_context[-3:], 1):
-                role = turn.get("role", "unknown")
-                content = turn.get("content", "")
-                preview = content[:200] + "..." if len(content) > 200 else content
-                context_parts.append(f"{role.upper()}: {preview}")
-            context_summary = "\n".join(context_parts)
+        if state is None:
+            state = {}
         
-        full_prompt = prompt
-        if context_summary:
-            full_prompt = f"""
-ORIGINAL USER MESSAGE:
-{user_prompt}
+        original_topic = state.get('original_topic', prompt)
+        depth_level = state.get('current_depth_level', 1)
+        aspects_explored = state.get('aspects_explored', [])
+        topic_summary = state.get('topic_summary', '')
+        last_question = state.get('last_followup_question', '')
+        iteration = state.get('iterations', 0)
+        
+        # Get recent context but preserve original topic
+        recent_context = await self.get_recent_context(n=4)
+        
+        # Phase 1: Quick answer to immediate follow-up (if any)
+        immediate_response = ""
+        if last_question and last_question.strip():
+            answer_prompt = f"""
+            ORIGINAL_TOPIC: {original_topic}
 
-IMPORTANT: DO NOT DEVIATE THE DISCUSSION FROM THE ORIGINAL USER MESSAGE!
+            TOPIC SUMMARY SO FAR:
+            {topic_summary if topic_summary else 'No summary yet'}
 
-RECENT CONVERSATION:
-{context_summary}
+            RECENT CONVERSATION CONTEXT:
+            {self._format_context(recent_context)}
 
-CURRENT USER MESSAGE:
-{prompt}"""
+            Given the original topic, topic summary, and recent conversation context, briefly answer this specific question: {last_question}
+            
+            Keep your answer to 1-2 sentences. We need to return focus to the main topic.
+            """
+            immediate_response = await self.generate_with_llm(answer_prompt)
         
-        if context:
-            full_prompt += f"\n\nADDITIONAL CONTEXT:\n{context}"
+        # Phase 2: Refocus on original topic with depth progression
+        refocus_prompt = f"""
+        ORIGINAL_TOPIC: {original_topic}
+        CURRENT_DEPTH_LEVEL: {depth_level}/5
+        ASPECTS_ALREADY_EXPLORED: {', '.join(aspects_explored) if aspects_explored else 'None yet'}
         
-        try:
-            result = await self.agent.ainvoke({
-                "messages": [HumanMessage(content=full_prompt)]
-            })
-            
-            messages = result.get("messages", [])
-            response = ""
-            
-            for msg in reversed(messages):
-                if isinstance(msg, AIMessage) and msg.content and not getattr(msg, 'tool_calls', None):
-                    response = msg.content
-                    response = strip_think(response)
-                    break
-            
-            if not response:
-                response = "I'm here to help. What would you like to explore?"
-            
-            await self.add_to_history("user", prompt)
-            await self.add_to_history("assistant", response)
-            
-            logger.info(f"GeneratorAgent generated {len(response)} characters")
-            return response
-            
-        except Exception as e:
-            logger.error(f"GeneratorAgent error: {str(e)}")
-            raise
+        RECENT_CONVERSATION_CONTEXT:
+        {self._format_context(recent_context)}
+        
+        Your task:
+        1. Think about {original_topic} at depth level {depth_level}
+        2. Identify an unexplored aspect of {original_topic}
+        3. Provide insight that advances understanding of {original_topic}
+        4. Ask ONE follow-up question that goes deeper into {original_topic}
+        
+        CRITICAL: Your follow-up question must be about {original_topic}, not about tangential topics.
+        
+        Depth Level {depth_level} Focus:
+        {self._get_depth_guidance(depth_level)}
+        """
+        
+        topic_advancement = await self.generate_with_llm(refocus_prompt)
+        
+        # Phase 3: Combine responses
+        if immediate_response:
+            combined_response = f"{immediate_response}\n{topic_advancement}"
+        else:
+            combined_response = topic_advancement
+        
+        # Extract and store the new follow-up question
+        new_followup = self._extract_followup_question(combined_response)
+
+        # Update conversation state
+        await self.add_to_history("user", prompt)
+        await self.add_to_history("assistant", combined_response)
+        
+        # Return response and state updates
+        state_updates = {
+            'last_followup_question': new_followup
+        }
+        
+        return combined_response, state_updates
+
+    def _get_depth_guidance(self, level: int) -> str:
+        """Provide guidance for what to explore at each depth level"""
+        guidance = {
+            1: "Focus on core definitions, basic concepts, and fundamental understanding",
+            2: "Explore underlying principles, mechanisms, and how things work",
+            3: "Examine real-world applications, examples, and practical implications", 
+            4: "Investigate challenges, limitations, controversies, and edge cases",
+            5: "Consider future directions, open questions, and cutting-edge developments"
+        }
+        return guidance.get(level, "Focus on advanced aspects and implications")
+
+    def _extract_followup_question(self, response: str) -> str:
+        """Extract the follow-up question from the response"""
+        import re
+        patterns = [
+            # Handle numbered format with potential newlines/whitespace after header
+            r'\*\*\d+\.\s*Follow[\u2011-]?up\s+questions?\*\*\s*[\n:]*\s*(.+?)(?=\n\n|\n\*\*|\Z)',
+            # Handle bold follow-up question with colon and/or whitespace
+            r'\*\*Follow[\u2011-]?up\s+questions?:\*\*\s*[\n]*\s*(.+?)(?=\n\n|\n\*\*|\Z)',
+            # Handle bold follow-up question without colon
+            r'\*\*Follow[\u2011-]?up\s+questions?\*\*\s*[\n:]*\s*(.+?)(?=\n\n|\n\*\*|\Z)',
+            # Handle plain text follow-up with potential whitespace
+            r'Follow[\u2011-]?up\s+questions?[\s:]*[\n]*\s*(.+?)(?=\n\n|\n\*\*|\Z)',
+            r'Follow[\u2011-]?up[\s:]+[\n]*\s*(.+?)(?=\n\n|\n\*\*|\Z)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, response, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+            if match:
+                # Clean up the extracted question
+                question = match.group(1).strip()
+                # Remove any leading/trailing whitespace and newlines
+                question = question.strip('\n\r\t ')
+                # If the question spans multiple lines, join them
+                question = ' '.join(question.split())
+                return question
+        
+        return ""
+
+    def _format_context(self, context: List[Dict]) -> str:
+        """Format recent context while preserving original topic focus"""
+        if not context:
+            return "No recent context"
+        
+        formatted = []
+        for turn in context[-3:]:  # Last 3 turns only
+            role = turn.get('role', 'unknown')
+            content = turn.get('content', '')[:150] + "..."
+            formatted.append(f"{role.upper()}: {content}")
+        
+        return "\n".join(formatted)
