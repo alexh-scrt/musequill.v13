@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 
 MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "25"))
+QUALITY_THRESHOLD = float(os.getenv("QUALITY_THRESHOLD", "60.0"))
+MAX_REFINEMENT_ITERATIONS = int(os.getenv("MAX_REFINEMENT_ITERATIONS", "3"))
 
 class WorkflowOrchestrator:
     """Orchestrate collaboration between agents using clean LangGraph architecture"""
@@ -91,11 +93,18 @@ class WorkflowOrchestrator:
                 content = content.replace("Follow-up:",'')
                 content = re.sub(r'^(\*\*)?(?:Answer|Response):(\*\*)?\s*', '', content, flags=re.MULTILINE)
                 
+                # Strip leading/trailing whitespace to ensure consistent formatting
+                content = content.strip()
+                
+                # Wrap user content in ** markers
+                if agent_id == "user":
+                    content = f"**{content}**"
+                
                 async with asyncio.Lock():
                     with open(self._log_filepath, "a", encoding="utf-8") as f:
                         f.write(f"<{agent_id}>\n")
-                        f.write(f"{content}\n")
-                        f.write(f"</{agent_id}>\n\n")
+                        f.write(f"\n{content}\n")
+                        f.write(f"\n</{agent_id}>\n\n")
                 
                 self._log_queue.task_done()
                 
@@ -112,24 +121,46 @@ class WorkflowOrchestrator:
         """Build the clean workflow graph with explicit phase transitions"""
         workflow = StateGraph(TopicFocusedState)
         
-        # Phase 1: Planning nodes
+        # Phase 1: Content generation nodes
         workflow.add_node("generator", self._generator_node)
         workflow.add_node("discriminator", self._discriminator_node)
-        workflow.add_node("summarizer", self._summarizer_node)  # NEW NODE
 
-        # Planning phase edges
+        # Phase 2: Evaluation nodes
+        workflow.add_node("generator_evaluator", self._generator_evaluator)
+        workflow.add_node("discriminator_evaluator", self._discriminator_evaluator)
+
+        # Phase 3: Summarization node
+        workflow.add_node("summarizer", self._summarizer_node)
+
+        # Starting point
         workflow.add_edge(START, "generator")
+
+        # Generator evaluation loop:
+        # Generator -> Generator_Evaluator -> (back to Generator OR forward to Discriminator)
         workflow.add_edge("generator", "generator_evaluator")
         workflow.add_conditional_edges(
             "generator_evaluator",
-            self._should_revise_generator
+            self._should_revise_generator,
+            {
+                "generator": "generator",  # Needs revision
+                "discriminator": "discriminator"  # Quality met, proceed
+            }
         )
+
+        # Discriminator evaluation loop:
+        # Discriminator -> Discriminator_Evaluator -> (back to Discriminator OR Generator OR Summarizer)
         workflow.add_edge("discriminator", "discriminator_evaluator")
         workflow.add_conditional_edges(
             "discriminator_evaluator",
-            self._should_revise_discriminator
+            self._should_revise_discriminator,
+            {
+                "discriminator": "discriminator",  # Needs revision
+                "generator": "generator",  # Continue conversation
+                "summarizer": "summarizer"  # Max iterations reached
+            }
         )
-        workflow.add_edge("discriminator_evaluator", "summarizer")
+
+        # Final summary to end
         workflow.add_edge("summarizer", END)
 
         # Compile with memory
@@ -138,6 +169,194 @@ class WorkflowOrchestrator:
         logger.info("✅ Workflow graph compiled successfully")
     
 
+    async def _generator_evaluator(self, state: TopicFocusedState) -> dict:
+        """Evaluate generator content and decide whether to revise or proceed"""
+        logger.info("📊 GENERATOR EVALUATOR")
+        
+        current_response = state.get("current_response", "")
+        generator_iterations = state.get("generator_iterations", 0)
+        generator_revisions = state.get("generator_revisions", [])
+        
+        # Prepare previous content for novelty comparison if we have revisions
+        previous_content = None
+        if generator_revisions:
+            previous_content = generator_revisions[-1][0]  # Last revision content
+        
+        # Use the EvaluatorAgent's sophisticated evaluation
+        eval_state = {
+            "previous_content": previous_content,
+            "context": state.get("context", {})
+        }
+        
+        # Call evaluator and get result
+        evaluation_result = await self.generator_evaluator.evaluate(
+            content=current_response,
+            previous_content=previous_content,
+            context=eval_state.get("context")
+        )
+        
+        quality_score = evaluation_result.total_score
+        
+        # Store this revision with its score
+        generator_revisions.append((current_response, quality_score))
+        
+        logger.info(f"Generator content quality: {quality_score:.1f}/100 ({evaluation_result.tier})")
+        if evaluation_result.critical_failures:
+            logger.warning(f"Critical failures: {evaluation_result.critical_failures}")
+        
+        # Use environment variables for thresholds
+        meets_quality = quality_score >= QUALITY_THRESHOLD
+        max_iterations_reached = generator_iterations >= MAX_REFINEMENT_ITERATIONS - 1
+        
+        if not meets_quality and not max_iterations_reached:
+            # Need revision and haven't hit max iterations
+            logger.info(f"Quality {quality_score:.1f} < {QUALITY_THRESHOLD}, requesting revision #{generator_iterations + 1}/{MAX_REFINEMENT_ITERATIONS}")
+            
+            return {
+                "generator_revisions": generator_revisions,
+                "generator_iterations": generator_iterations + 1,
+                "evaluator_feedback": evaluation_result.detailed_feedback,
+                "quality_scores": {**state.get("quality_scores", {}), f"generator_{generator_iterations}": quality_score},
+                "evaluation": evaluation_result
+            }
+        else:
+            # Either quality met or max iterations reached - select best content
+            best_content, best_score = max(generator_revisions, key=lambda x: x[1])
+            
+            if meets_quality:
+                logger.info(f"✅ Quality threshold met ({quality_score:.1f} >= {QUALITY_THRESHOLD})")
+            else:
+                logger.info(f"⚠️ Max iterations reached ({MAX_REFINEMENT_ITERATIONS}), using best score: {best_score:.1f}")
+            
+            logger.info(f"Selecting best generator content with score {best_score:.1f}")
+            
+            return {
+                "generator_revisions": generator_revisions,
+                "generator_iterations": generator_iterations,
+                "best_generator_content": best_content,
+                "current_response": best_content,
+                "evaluator_feedback": None,
+                "quality_scores": {**state.get("quality_scores", {}), "generator_final": best_score},
+                "evaluation": evaluation_result
+            }
+    
+    async def _discriminator_evaluator(self, state: TopicFocusedState) -> dict:
+        """Evaluate discriminator response and decide routing"""
+        logger.info("📊 DISCRIMINATOR EVALUATOR")
+        
+        current_response = state.get("current_response", "")
+        discriminator_iterations = state.get("discriminator_iterations", 0)
+        discriminator_revisions = state.get("discriminator_revisions", [])
+        iterations = state.get("iterations", 0)
+        
+        # Prepare previous content for comparison if we have revisions
+        previous_content = None
+        if discriminator_revisions:
+            previous_content = discriminator_revisions[-1][0]
+        
+        # Use the EvaluatorAgent's sophisticated evaluation
+        eval_state = {
+            "previous_content": previous_content,
+            "context": state.get("context", {})
+        }
+        
+        # Call evaluator and get result
+        evaluation_result = await self.discriminator_evaluator.evaluate(
+            content=current_response,
+            previous_content=previous_content,
+            context=eval_state.get("context")
+        )
+        
+        quality_score = evaluation_result.total_score
+        
+        # Store this revision
+        discriminator_revisions.append((current_response, quality_score))
+        
+        logger.info(f"Discriminator response quality: {quality_score:.1f}/100 ({evaluation_result.tier})")
+        if evaluation_result.critical_failures:
+            logger.warning(f"Critical failures: {evaluation_result.critical_failures}")
+        
+        # Use environment variables for thresholds
+        max_iterations = int(os.getenv("MAX_ITERATIONS", "3"))
+        meets_quality = quality_score >= QUALITY_THRESHOLD
+        max_refinements_reached = discriminator_iterations >= MAX_REFINEMENT_ITERATIONS - 1
+        
+        # First check if we need revision (quality not met and can still refine)
+        if not meets_quality and not max_refinements_reached:
+            logger.info(f"Quality {quality_score:.1f} < {QUALITY_THRESHOLD}, requesting revision #{discriminator_iterations + 1}/{MAX_REFINEMENT_ITERATIONS}")
+            
+            return {
+                "discriminator_revisions": discriminator_revisions,
+                "discriminator_iterations": discriminator_iterations + 1,
+                "evaluator_feedback": evaluation_result.detailed_feedback,
+                "quality_scores": {**state.get("quality_scores", {}), f"discriminator_rev_{discriminator_iterations}": quality_score},
+                "evaluation": evaluation_result
+            }
+        
+        # Quality met or max refinements reached - select best discriminator response
+        best_response, best_score = max(discriminator_revisions, key=lambda x: x[1])
+        
+        if meets_quality:
+            logger.info(f"✅ Quality threshold met ({quality_score:.1f} >= {QUALITY_THRESHOLD})")
+        else:
+            logger.info(f"⚠️ Max refinements reached ({MAX_REFINEMENT_ITERATIONS}), using best score: {best_score:.1f}")
+        
+        # Now decide routing based on conversation iterations
+        if iterations < max_iterations:
+            logger.info(f"Iteration {iterations + 1}/{max_iterations}: Continuing conversation")
+            # Route back to generator for next iteration
+            return {
+                "discriminator_revisions": discriminator_revisions,
+                "discriminator_iterations": 0,  # Reset for next round
+                "generator_iterations": 0,  # Reset generator iterations
+                "iterations": iterations + 1,
+                "last_followup_question": best_response,  # Use best response
+                "evaluator_feedback": None,
+                "generator_revisions": [],  # Clear for next round
+                "quality_scores": {**state.get("quality_scores", {}), f"discriminator_{iterations}": best_score},
+                "current_response": best_response,  # Ensure best response is used
+                "evaluation": evaluation_result
+            }
+        else:
+            logger.info(f"Reached max iterations ({max_iterations}), routing to summarizer")
+            # Route to summarizer with best response
+            return {
+                "discriminator_revisions": discriminator_revisions,
+                "discriminator_iterations": discriminator_iterations,
+                "iterations": iterations,
+                "quality_scores": {**state.get("quality_scores", {}), "discriminator_final": best_score},
+                "current_response": best_response,  # Ensure best response is used
+                "evaluation": evaluation_result,
+                "evaluator_feedback": None  # Clear feedback to ensure proper routing
+            }
+    
+    def _should_revise_generator(self, state: TopicFocusedState) -> str:
+        """Determine if generator needs revision or proceed to discriminator"""
+        feedback = state.get("evaluator_feedback")
+        if feedback:
+            # Has feedback, needs revision
+            return "generator"
+        else:
+            # No feedback, proceed to discriminator
+            return "discriminator"
+    
+    def _should_revise_discriminator(self, state: TopicFocusedState) -> str:
+        """Determine routing after discriminator evaluation"""
+        feedback = state.get("evaluator_feedback")
+        iterations = state.get("iterations", 0)
+        max_iterations = int(os.getenv("MAX_ITERATIONS", "3"))
+        
+        if feedback:
+            # Has feedback, needs revision
+            return "discriminator"
+        elif iterations >= max_iterations:
+            # Reached iteration threshold, go to summarizer
+            return "summarizer"
+        else:
+            # Continue conversation, back to generator
+            return "generator"
+    
+    
     def _should_stop(self, state: TopicFocusedState) -> str:
         if state.get("END") or state.get("STOP"):
             return END
@@ -181,15 +400,22 @@ class WorkflowOrchestrator:
     async def _generator_node(self, state: TopicFocusedState) -> dict:
         logger.info("📋  GENERATOR")
         iteration = state.get("iterations", 0)
-        logger.info(f"📋  GENERATOR iteration {iteration + 1}")
+        generator_iteration = state.get("generator_iterations", 0)
+        logger.info(f"📋  GENERATOR iteration {iteration + 1}, revision {generator_iteration}")
         
         original_topic = state.get("original_topic", "")
         current_depth_level = state.get("current_depth_level", 1)
         aspects_explored = state.get("aspects_explored", [])
         topic_summary = state.get("topic_summary", "")
         last_followup_question = state.get("last_followup_question", "")
+        evaluator_feedback = state.get("evaluator_feedback", "")
         
-        user_prompt = last_followup_question if last_followup_question else original_topic
+        # Determine the prompt
+        if evaluator_feedback and generator_iteration > 0:
+            # Include feedback for revision
+            user_prompt = f"Previous response received feedback: {evaluator_feedback}\n\nPlease revise your response for: {last_followup_question if last_followup_question else original_topic}"
+        else:
+            user_prompt = last_followup_question if last_followup_question else original_topic
         
         response, state_updates = await self.generator.process(user_prompt, state=state)
         
@@ -203,17 +429,30 @@ class WorkflowOrchestrator:
     async def _discriminator_node(self, state: TopicFocusedState) -> dict:
         logger.info("📋  DISCRIMINATOR")
         iteration = state.get("iterations", 0)
-        logger.info(f"📋  DISCRIMINATOR iteration {iteration + 1}")
+        discriminator_iteration = state.get("discriminator_iterations", 0)
+        logger.info(f"📋  DISCRIMINATOR iteration {iteration + 1}, revision {discriminator_iteration}")
         
-        generator_response = state.get("current_response", "")
-        response, state_updates = await self.discriminator.process(generator_response, state)
+        # Use best generator content if available, otherwise current response
+        best_generator_content = state.get("best_generator_content")
+        generator_response = best_generator_content if best_generator_content else state.get("current_response", "")
+        evaluator_feedback = state.get("evaluator_feedback", "")
+        
+        # Include feedback if this is a revision
+        if evaluator_feedback and discriminator_iteration > 0:
+            logger.info(f"Including evaluator feedback in discriminator prompt")
+            # Modify the response based on feedback
+            response, state_updates = await self.discriminator.process(
+                f"Feedback on previous response: {evaluator_feedback}\n\nPlease revise your response to: {generator_response}", 
+                state
+            )
+        else:
+            response, state_updates = await self.discriminator.process(generator_response, state)
         
         should_end = "STOP" in response.upper()
         
         return {
             **state_updates,
             "current_response": response,
-            "iterations": iteration + 1,
             "END": should_end
         }
     
@@ -235,7 +474,17 @@ class WorkflowOrchestrator:
             topic_summary="",
             last_followup_question="",
             iterations=0,
-            current_response=""
+            current_response="",
+            # Initialize quality tracking fields
+            generator_revisions=[],
+            discriminator_revisions=[],
+            evaluator_feedback=None,
+            quality_scores={},
+            generator_iterations=0,
+            discriminator_iterations=0,
+            best_generator_content=None,
+            evaluation=None,
+            context={}
         )
  
         
@@ -287,24 +536,38 @@ class WorkflowOrchestrator:
                     #     is_final=False
                     # )
                 
-                # Handle completion
-                if event_kind == "on_chain_end" and event_name in ["generator", "discriminator"]:
+                # Handle evaluator completion - log only best revisions
+                if event_kind == "on_chain_end" and event_name in ["generator_evaluator", "discriminator_evaluator"]:
                     output = event_data.get("output", {})
-                    content = output.get("current_response", "")
                     
-                    if content:
-                        self._log_queue.put_nowait({
-                            "agent_id": event_name,
-                            "content": content
-                        })
+                    # Check if this evaluator selected the best content (not requesting revision)
+                    if not output.get("evaluator_feedback"):
+                        # No feedback means best content was selected
+                        best_content = None
+                        agent_type = None
                         
-                        preview = content[:1000] + "..." if len(content) > 1000 else content
-                        yield AgentResponse(
-                            agent_id=event_name,
-                            content=preview,
-                            iteration=output.get("iteration", 0),
-                            is_final=False
-                        )
+                        if event_name == "generator_evaluator":
+                            best_content = output.get("best_generator_content") or output.get("current_response")
+                            agent_type = "generator"
+                        elif event_name == "discriminator_evaluator":
+                            best_content = output.get("current_response")
+                            agent_type = "discriminator"
+                        
+                        if best_content and agent_type:
+                            # Log the best revision
+                            self._log_queue.put_nowait({
+                                "agent_id": agent_type,
+                                "content": best_content
+                            })
+                            
+                            # Send preview to client
+                            preview = best_content[:1000] + "..." if len(best_content) > 1000 else best_content
+                            yield AgentResponse(
+                                agent_id=agent_type,
+                                content=preview,
+                                iteration=output.get("iterations", 0),
+                                is_final=False
+                            )
                     
                     await asyncio.sleep(0.5)
             

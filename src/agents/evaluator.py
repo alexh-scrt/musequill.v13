@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 import json
@@ -261,9 +262,10 @@ class EvaluatorAgent(BaseAgent):
         # Section-level analysis
         section_analysis = self._analyze_sections(content, previous_content)
         
-        # Check if passes threshold
+        # Check if passes threshold - use environment variable if set
+        quality_threshold = float(os.getenv("QUALITY_THRESHOLD", str(self.TIER_THRESHOLDS['acceptable'])))
         pass_threshold = (
-            total_score >= self.TIER_THRESHOLDS['acceptable'] and
+            total_score >= quality_threshold and
             len(critical_failures) == 0
         )
         

@@ -426,9 +426,15 @@ class SummarizerAgent(BaseAgent):
         summary_parts.append(f"**Overall Score: {quality_assessment['overall_score']:.1f}/100**")
         summary_parts.append("")
         summary_parts.append("**Quantitative Metrics:**")
-        summary_parts.append(f"- Conceptual Novelty: {quality_assessment['evaluation_details'].metrics.get('conceptual_novelty', {}).get('percentage', 0):.0f}%")
-        summary_parts.append(f"- Claim Density: {quality_assessment['evaluation_details'].metrics.get('claim_density', {}).get('percentage', 0):.0f}%")
-        summary_parts.append(f"- Structural Coherence: {quality_assessment['evaluation_details'].metrics.get('structural_coherence', {}).get('percentage', 0):.0f}%")
+        metrics = quality_assessment['evaluation_details'].metrics
+        
+        # Access MetricScore objects properly
+        if 'conceptual_novelty' in metrics:
+            summary_parts.append(f"- Conceptual Novelty: {metrics['conceptual_novelty'].percentage:.0f}%")
+        if 'claim_density' in metrics:
+            summary_parts.append(f"- Claim Density: {metrics['claim_density'].percentage:.0f}%")
+        if 'structural_coherence' in metrics:
+            summary_parts.append(f"- Structural Coherence: {metrics['structural_coherence'].percentage:.0f}%")
         summary_parts.append("")
         summary_parts.append("**Qualitative Assessment:**")
         # Extract key lines from qualitative assessment
