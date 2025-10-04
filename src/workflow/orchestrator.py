@@ -35,7 +35,7 @@ MAX_REFINEMENT_ITERATIONS = int(os.getenv("MAX_REFINEMENT_ITERATIONS", "3"))
 class WorkflowOrchestrator:
     """Orchestrate collaboration between agents using clean LangGraph architecture"""
     
-    def __init__(self, session_id: Optional[str] = None, generator_profile: str = "balanced", discriminator_profile: str = "balanced"):
+    def __init__(self, session_id: Optional[str] = None, generator_profile: str = "balanced", discriminator_profile: str = "balanced", evaluator_profile: str = "general"):
         self.session_id = session_id or f"session_{uuid.uuid4().hex[:12]}"
         
         # Get LLM parameters from profile factories
@@ -44,6 +44,7 @@ class WorkflowOrchestrator:
         
         logger.info(f"Generator profile: {generator_profile}")
         logger.info(f"Discriminator profile: {discriminator_profile}")
+        logger.info(f"Evaluator profile: {evaluator_profile}")
         
         self.generator = GeneratorAgent(
             session_id=self.session_id, 
@@ -54,16 +55,19 @@ class WorkflowOrchestrator:
             llm_params=disc_params)        
 
         self.generator_evaluator = EvaluatorAgent(
-            session_id=self.session_id
+            session_id=self.session_id,
+            profile=evaluator_profile
         )
 
         self.discriminator_evaluator = EvaluatorAgent(
-            session_id=self.session_id
+            session_id=self.session_id,
+            profile=evaluator_profile
         )
 
         self.summarizer = SummarizerAgent(
             session_id=self.session_id,
-            llm_params={'temperature': 0.3}  # Lower temp for consistency
+            llm_params={'temperature': 0.3},  # Lower temp for consistency
+            evaluator_profile=evaluator_profile
         )
 
         self.graph = None

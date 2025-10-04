@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Musequill CLI Client with Evaluator Profile Support
+Enhanced Musequill CLI Client with Evaluator Profile Support
 
 Usage:
     python client.py "Topic" --profile technology
@@ -16,7 +16,7 @@ from datetime import datetime
 from websockets import connect
 from websockets.exceptions import ConnectionClosed
 
-from src.agents.evaluator_profiles import EvaluatorProfileFactory
+from src.agents.profiles import EvaluatorProfileFactory
 
 
 async def send_content_request(
@@ -42,6 +42,7 @@ async def send_content_request(
 
 
 async def receive_messages(websocket):
+    """Receive and display messages from server"""
     try:
         async for message in websocket:
             data = json.loads(message)
@@ -74,7 +75,10 @@ async def receive_messages(websocket):
                 break
             
             elif msg_type == "ping":
-                await websocket.send(json.dumps({"type": "pong", "timestamp": datetime.now().isoformat()}))
+                await websocket.send(json.dumps({
+                    "type": "pong", 
+                    "timestamp": datetime.now().isoformat()
+                }))
             
             elif msg_type == "pong":
                 pass
@@ -132,7 +136,7 @@ def list_profiles():
         # Get detailed info
         try:
             info = EvaluatorProfileFactory.get_profile_info(profile_id)
-            print(f"   Critical metrics: {', '.join(info['critical_metrics']) if info['critical_metrics'] else 'None'}")
+            print(f"   Critical metrics: {', '.join(info['critical_metrics'])}")
             print(f"   Top priorities:")
             for name, config in info['top_priorities']:
                 print(f"     • {name}: {config['weight']} points")

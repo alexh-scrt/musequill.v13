@@ -29,7 +29,8 @@ class SummarizerAgent(BaseAgent):
         agent_id: str = "summarizer", 
         model: Optional[str] = None, 
         session_id: Optional[str] = None, 
-        llm_params: Optional[Dict[str, Any]] = None
+        llm_params: Optional[Dict[str, Any]] = None,
+        evaluator_profile: str = "general"
     ):
         super().__init__(
             agent_id, 
@@ -42,7 +43,8 @@ class SummarizerAgent(BaseAgent):
         # Initialize evaluator for quality assessment
         self.evaluator = EvaluatorAgent(
             session_id=session_id,
-            llm_params={"temperature": 0.3}
+            llm_params={"temperature": 0.3},
+            profile=evaluator_profile
         )
         
         logger.info(f"SummarizerAgent initialized with model: {self.model}")

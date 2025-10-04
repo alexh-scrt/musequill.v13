@@ -35,6 +35,7 @@ class ContentRequest(BaseModel):
     mode: AgentMode = AgentMode.COLLABORATOR
     max_iterations: Optional[int] = 3
     stream: Optional[bool] = True
+    evaluator_profile: Optional[str] = "general"
 
 
 class AgentResponse(BaseModel):

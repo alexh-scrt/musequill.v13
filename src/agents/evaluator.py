@@ -1,3 +1,13 @@
+"""
+Enhanced EvaluatorAgent with domain-specific profiles
+
+Key changes:
+- Accepts profile parameter in __init__
+- Loads metric config from profile
+- Dynamic metric weights and thresholds
+- Profile-aware feedback generation
+"""
+
 import logging
 import os
 from typing import Dict, List, Optional, Any, Tuple
@@ -5,6 +15,7 @@ from dataclasses import dataclass
 import json
 
 from src.agents.base import BaseAgent
+from src.agents.evaluator_profiles import EvaluatorProfileFactory, ProfileType
 from src.agents.metrics import (
     calculate_cnr,
     calculate_claim_density,
@@ -44,98 +55,30 @@ class EvaluationResult:
     section_analysis: Dict[str, Dict]
     pass_threshold: bool
     detailed_feedback: str
+    profile_name: str  # Which profile was used
 
 
 class EvaluatorAgent(BaseAgent):
-    """Agent that evaluates scientific content quality"""
-    
-    # Metric weights and thresholds
-    METRIC_CONFIG = {
-        'conceptual_novelty': {
-            'weight': 15,
-            'min_threshold': 6,
-            'optimal': 15,
-            'calculation': 'CNR >= 40%'
-        },
-        'claim_density': {
-            'weight': 10,
-            'min_threshold': 5,
-            'optimal': 10,
-            'calculation': '>= 0.8 claims/100 words'
-        },
-        'mathematical_rigor': {
-            'weight': 15,
-            'min_threshold': 9,
-            'optimal': 15,
-            'calculation': '80%+ proofs, 70%+ citations'
-        },
-        'semantic_compression': {
-            'weight': 15,
-            'min_threshold': 7,
-            'optimal': 15,
-            'calculation': 'SCR <= 5:1'
-        },
-        'citation_context': {
-            'weight': 10,
-            'min_threshold': 5,
-            'optimal': 10,
-            'calculation': '5-40 cites/10pg + novelty statement'
-        },
-        'empirical_grounding': {
-            'weight': 10,
-            'min_threshold': 4,
-            'optimal': 10,
-            'calculation': '1+ testable prediction'
-        },
-        'structural_coherence': {
-            'weight': 10,
-            'min_threshold': 7,
-            'optimal': 10,
-            'calculation': 'No circular reasoning'
-        },
-        'notation_consistency': {
-            'weight': 5,
-            'min_threshold': 4,
-            'optimal': 5,
-            'calculation': '95%+ consistency'
-        },
-        'figure_utility': {
-            'weight': 5,
-            'min_threshold': 3,
-            'optimal': 5,
-            'calculation': '80%+ informative'
-        },
-        'parsimony': {
-            'weight': 5,
-            'min_threshold': 3,
-            'optimal': 5,
-            'calculation': '70%+ essential assumptions'
-        }
-    }
-    
-    # Tier thresholds
-    TIER_THRESHOLDS = {
-        'excellent': 90,
-        'good': 75,
-        'acceptable': 60,
-        'poor': 40,
-        'unacceptable': 0
-    }
-    
-    # Critical failure metrics (auto-reject if below threshold)
-    CRITICAL_METRICS = [
-        'mathematical_rigor',
-        'semantic_compression',
-        'conceptual_novelty'
-    ]
+    """Agent that evaluates content quality using domain-specific profiles"""
     
     def __init__(
         self,
         agent_id: str = "evaluator",
         model: Optional[str] = None,
         session_id: Optional[str] = None,
-        llm_params: Optional[Dict[str, Any]] = None
+        llm_params: Optional[Dict[str, Any]] = None,
+        profile: ProfileType = "general"
     ):
+        """
+        Initialize evaluator with a specific profile.
+        
+        Args:
+            agent_id: Agent identifier
+            model: LLM model to use
+            session_id: Session identifier
+            llm_params: LLM parameters
+            profile: Content domain profile (scientific, technology, etc.)
+        """
         super().__init__(
             agent_id,
             web_search=False,  # Evaluator doesn't need web search
@@ -143,7 +86,22 @@ class EvaluatorAgent(BaseAgent):
             session_id=session_id,
             llm_params=llm_params
         )
-        logger.info(f"EvaluatorAgent initialized with model: {self.model}")
+        
+        # Load profile configuration
+        self.profile = profile
+        profile_config = EvaluatorProfileFactory.get(profile)
+        
+        self.profile_name = profile_config['name']
+        self.profile_description = profile_config['description']
+        self.METRIC_CONFIG = profile_config['metric_config']
+        self.TIER_THRESHOLDS = profile_config['tier_thresholds']
+        self.CRITICAL_METRICS = profile_config.get('critical_metrics', [])
+        
+        logger.info(
+            f"EvaluatorAgent initialized with model: {self.model}, "
+            f"profile: {self.profile_name}"
+        )
+        logger.info(f"Critical metrics: {self.CRITICAL_METRICS}")
     
     async def evaluate(
         self,
@@ -152,7 +110,7 @@ class EvaluatorAgent(BaseAgent):
         context: Optional[Dict[str, Any]] = None
     ) -> EvaluationResult:
         """
-        Evaluate content quality across all metrics
+        Evaluate content quality across all metrics using the selected profile.
         
         Args:
             content: The content to evaluate
@@ -162,90 +120,100 @@ class EvaluatorAgent(BaseAgent):
         Returns:
             EvaluationResult with scores and feedback
         """
-        logger.info("Starting content evaluation...")
+        logger.info(f"Starting content evaluation with profile: {self.profile_name}")
         
         # Calculate all metrics
         metrics = {}
         
         # 1. Conceptual Novelty Rate
-        cnr_data = calculate_cnr(content, previous_content)
-        metrics['conceptual_novelty'] = self._score_metric(
-            'conceptual_novelty',
-            cnr_data['score'],
-            cnr_data
-        )
+        if self.METRIC_CONFIG['conceptual_novelty']['weight'] > 0:
+            cnr_data = calculate_cnr(content, previous_content)
+            metrics['conceptual_novelty'] = self._score_metric(
+                'conceptual_novelty',
+                cnr_data['score'],
+                cnr_data
+            )
         
         # 2. Claim Density
-        cd_data = calculate_claim_density(content)
-        metrics['claim_density'] = self._score_metric(
-            'claim_density',
-            cd_data['score'],
-            cd_data
-        )
+        if self.METRIC_CONFIG['claim_density']['weight'] > 0:
+            cd_data = calculate_claim_density(content)
+            metrics['claim_density'] = self._score_metric(
+                'claim_density',
+                cd_data['score'],
+                cd_data
+            )
         
         # 3. Mathematical Rigor
-        mr_data = calculate_mathematical_rigor(content)
-        metrics['mathematical_rigor'] = self._score_metric(
-            'mathematical_rigor',
-            mr_data['score'],
-            mr_data
-        )
+        if self.METRIC_CONFIG['mathematical_rigor']['weight'] > 0:
+            mr_data = calculate_mathematical_rigor(content)
+            metrics['mathematical_rigor'] = self._score_metric(
+                'mathematical_rigor',
+                mr_data['score'],
+                mr_data
+            )
         
         # 4. Semantic Compression Ratio
-        scr_data = calculate_compression_ratio(content, previous_content)
-        metrics['semantic_compression'] = self._score_metric(
-            'semantic_compression',
-            scr_data['score'],
-            scr_data
-        )
+        if self.METRIC_CONFIG['semantic_compression']['weight'] > 0:
+            scr_data = calculate_compression_ratio(content, previous_content)
+            metrics['semantic_compression'] = self._score_metric(
+                'semantic_compression',
+                scr_data['score'],
+                scr_data
+            )
         
         # 5. Citation & Context
-        citation_data = calculate_citation_metrics(content, context)
-        metrics['citation_context'] = self._score_metric(
-            'citation_context',
-            citation_data['score'],
-            citation_data
-        )
+        if self.METRIC_CONFIG['citation_context']['weight'] > 0:
+            citation_data = calculate_citation_metrics(content, context)
+            metrics['citation_context'] = self._score_metric(
+                'citation_context',
+                citation_data['score'],
+                citation_data
+            )
         
         # 6. Empirical Grounding
-        eg_data = calculate_empirical_grounding(content)
-        metrics['empirical_grounding'] = self._score_metric(
-            'empirical_grounding',
-            eg_data['score'],
-            eg_data
-        )
+        if self.METRIC_CONFIG['empirical_grounding']['weight'] > 0:
+            eg_data = calculate_empirical_grounding(content)
+            metrics['empirical_grounding'] = self._score_metric(
+                'empirical_grounding',
+                eg_data['score'],
+                eg_data
+            )
         
         # 7. Structural Coherence
-        sc_data = calculate_structural_coherence(content)
-        metrics['structural_coherence'] = self._score_metric(
-            'structural_coherence',
-            sc_data['score'],
-            sc_data
-        )
+        if self.METRIC_CONFIG['structural_coherence']['weight'] > 0:
+            sc_data = calculate_structural_coherence(content)
+            metrics['structural_coherence'] = self._score_metric(
+                'structural_coherence',
+                sc_data['score'],
+                sc_data
+            )
         
         # 8. Notation Consistency
-        nc_data = calculate_notation_consistency(content)
-        metrics['notation_consistency'] = self._score_metric(
-            'notation_consistency',
-            nc_data['score'],
-            nc_data
-        )
+        if self.METRIC_CONFIG['notation_consistency']['weight'] > 0:
+            nc_data = calculate_notation_consistency(content)
+            metrics['notation_consistency'] = self._score_metric(
+                'notation_consistency',
+                nc_data['score'],
+                nc_data
+            )
         
         # 9. Figure/Equation Utility
-        fe_data = calculate_figure_utility(content, context)
-        metrics['figure_utility'] = self._score_metric(
-            'figure_utility',
-            fe_data['score'],
-            fe_data
-        )
+        if self.METRIC_CONFIG['figure_utility']['weight'] > 0:
+            fe_data = calculate_figure_utility(content, context)
+            metrics['figure_utility'] = self._score_metric(
+                'figure_utility',
+                fe_data['score'],
+                fe_data
+            )
         
         # 10. Parsimony
-        pars_data = calculate_parsimony(content)
-        metrics['parsimony'] = self._score_metric(
-            'parsimony',
-            pars_data['score'],
-            pars_data
-        )
+        if self.METRIC_CONFIG['parsimony']['weight'] > 0:
+            pars_data = calculate_parsimony(content)
+            metrics['parsimony'] = self._score_metric(
+                'parsimony',
+                pars_data['score'],
+                pars_data
+            )
         
         # Calculate total score
         total_score = sum(m.score for m in metrics.values())
@@ -262,8 +230,10 @@ class EvaluatorAgent(BaseAgent):
         # Section-level analysis
         section_analysis = self._analyze_sections(content, previous_content)
         
-        # Check if passes threshold - use environment variable if set
-        quality_threshold = float(os.getenv("QUALITY_THRESHOLD", str(self.TIER_THRESHOLDS['acceptable'])))
+        # Check if passes threshold - use environment variable or profile default
+        quality_threshold = float(
+            os.getenv("QUALITY_THRESHOLD", str(self.TIER_THRESHOLDS['acceptable']))
+        )
         pass_threshold = (
             total_score >= quality_threshold and
             len(critical_failures) == 0
@@ -286,10 +256,14 @@ class EvaluatorAgent(BaseAgent):
             priority_actions=priority_actions,
             section_analysis=section_analysis,
             pass_threshold=pass_threshold,
-            detailed_feedback=detailed_feedback
+            detailed_feedback=detailed_feedback,
+            profile_name=self.profile_name
         )
         
-        logger.info(f"Evaluation complete: {total_score:.1f}/100 ({tier})")
+        logger.info(
+            f"Evaluation complete: {total_score:.1f}/100 ({tier}) "
+            f"[Profile: {self.profile_name}]"
+        )
         return result
     
     def _score_metric(
@@ -311,7 +285,7 @@ class EvaluatorAgent(BaseAgent):
         # Clamp to [0, max_points]
         normalized = max(0, min(normalized, max_points))
         
-        percentage = (normalized / max_points) * 100
+        percentage = (normalized / max_points) * 100 if max_points > 0 else 0
         threshold_met = normalized >= config['min_threshold']
         
         # Generate suggestions if below threshold
@@ -355,12 +329,13 @@ class EvaluatorAgent(BaseAgent):
         failures = []
         
         for metric_name in self.CRITICAL_METRICS:
-            metric = metrics[metric_name]
-            if not metric.threshold_met:
-                failures.append(
-                    f"{metric.name}: {metric.score:.1f}/{metric.max_points} "
-                    f"(need {self.METRIC_CONFIG[metric_name]['min_threshold']})"
-                )
+            if metric_name in metrics:
+                metric = metrics[metric_name]
+                if not metric.threshold_met:
+                    failures.append(
+                        f"{metric.name}: {metric.score:.1f}/{metric.max_points} "
+                        f"(need {self.METRIC_CONFIG[metric_name]['min_threshold']})"
+                    )
         
         return failures
     
@@ -374,7 +349,7 @@ class EvaluatorAgent(BaseAgent):
         # Sort metrics by how far below threshold they are
         issues = []
         for name, metric in metrics.items():
-            if not metric.threshold_met:
+            if not metric.threshold_met and metric.max_points > 0:
                 threshold = self.METRIC_CONFIG[name]['min_threshold']
                 deficit = threshold - metric.score
                 issues.append((deficit / metric.max_points, name, metric))
@@ -424,8 +399,6 @@ class EvaluatorAgent(BaseAgent):
     
     def _split_sections(self, content: str) -> List[str]:
         """Split content into logical sections"""
-        # Simple split on major headers or paragraphs
-        # TODO: Implement more sophisticated section detection
         sections = content.split('\n\n')
         return [s.strip() for s in sections if s.strip()]
     
@@ -485,6 +458,18 @@ class EvaluatorAgent(BaseAgent):
                     "Add 'Related Work' section explaining what's new vs. established"
                 )
         
+        elif metric_name == 'empirical_grounding':
+            if details.get('predictions', 0) < 1:
+                suggestions.append(
+                    "Add concrete examples, test results, or real-world data"
+                )
+        
+        elif metric_name == 'structural_coherence':
+            if details.get('circular_patterns', 0) > 2:
+                suggestions.append(
+                    f"Fix circular reasoning: {details.get('circular_patterns')} patterns detected"
+                )
+        
         return suggestions
     
     def _generate_detailed_feedback(
@@ -498,7 +483,8 @@ class EvaluatorAgent(BaseAgent):
         """Generate human-readable detailed feedback"""
         feedback_parts = []
         
-        # Overall assessment
+        # Header with profile info
+        feedback_parts.append(f"EVALUATION PROFILE: {self.profile_name}")
         feedback_parts.append(f"OVERALL SCORE: {total_score:.1f}/100 ({tier})")
         feedback_parts.append("")
         
@@ -509,9 +495,17 @@ class EvaluatorAgent(BaseAgent):
                 feedback_parts.append(f"  ✗ {failure}")
             feedback_parts.append("")
         
-        # Metric breakdown
+        # Metric breakdown - only show metrics with weight > 0
         feedback_parts.append("METRIC BREAKDOWN:")
-        for name, metric in metrics.items():
+        active_metrics = [
+            (name, metric) for name, metric in metrics.items() 
+            if metric.max_points > 0
+        ]
+        
+        # Sort by weight (descending) for better readability
+        active_metrics.sort(key=lambda x: x[1].max_points, reverse=True)
+        
+        for name, metric in active_metrics:
             status = "✓" if metric.threshold_met else "✗"
             feedback_parts.append(
                 f"  {status} {name}: {metric.score:.1f}/{metric.max_points} "
@@ -527,9 +521,9 @@ class EvaluatorAgent(BaseAgent):
             feedback_parts.append("")
         
         # Recommendation
-        if total_score >= 75:
+        if total_score >= self.TIER_THRESHOLDS['good']:
             feedback_parts.append("RECOMMENDATION: Accept with minor revisions")
-        elif total_score >= 60:
+        elif total_score >= self.TIER_THRESHOLDS['acceptable']:
             feedback_parts.append("RECOMMENDATION: Revise and resubmit")
         else:
             feedback_parts.append("RECOMMENDATION: Major revision or reject")

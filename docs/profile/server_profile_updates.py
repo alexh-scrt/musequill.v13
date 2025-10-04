@@ -1,48 +1,33 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
-import asyncio
-import json
-import logging
-from typing import Dict
+# Update to src/server/models.py - Add evaluator_profile to ContentRequest
+
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+from enum import Enum
 from datetime import datetime
-import os
-
-from src.server.models import WebSocketMessage, MessageType, ContentRequest
-from src.workflow.orchestrator import WorkflowOrchestrator
-from src.llm.ollama_client import OllamaClient
 
 
-logger = logging.getLogger(__name__)
-
-app = FastAPI(title="Musequill Content Creator")
-
-# Store active connections
-active_connections: Dict[str, WebSocket] = {}
+class AgentMode(str, Enum):
+    COLLABORATOR = "collaborator"
+    SIMPLE = "simple"
 
 
-@app.get("/")
-async def root():
-    return {"message": "Musequill Content Creator API", "status": "running"}
+class MessageType(str, Enum):
+    USER_INPUT = "user_input"
+    AGENT_RESPONSE = "agent_response"
+    STATUS = "status"
+    ERROR = "error"
+    STOP = "stop"
 
 
-@app.get("/health")
-async def health_check():
-    try:
-        # Check Ollama connection
-        client = OllamaClient()
-        models = await client.list_models()
-        return {
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "ollama_connected": len(models) > 0,
-            "available_models": models
-        }
-    except Exception as e:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "unhealthy", "error": str(e)}
-        )
+class ContentRequest(BaseModel):
+    topic: str
+    mode: AgentMode = AgentMode.COLLABORATOR
+    max_iterations: Optional[int] = 3
+    stream: Optional[bool] = True
+    evaluator_profile: Optional[str] = "general"  # NEW FIELD
 
+
+# Update to src/server/app.py - Handle profile in request
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -61,15 +46,13 @@ async def websocket_endpoint(websocket: WebSocket):
         })
         
         while True:
-            # Receive message from client with 5-minute timeout
             try:
                 data = await asyncio.wait_for(
                     websocket.receive_text(), 
-                    timeout=300.0  # 5 minutes timeout for debugging
+                    timeout=300.0
                 )
                 message_data = json.loads(data)
             except asyncio.TimeoutError:
-                # Send keepalive ping on timeout
                 await websocket.send_json({
                     "type": "ping",
                     "timestamp": datetime.now().isoformat()
@@ -80,23 +63,29 @@ async def websocket_endpoint(websocket: WebSocket):
             if message_data.get("type") == "content_request":
                 request = ContentRequest(**message_data.get("data", {}))
                 
-                # Send status update
+                # Extract evaluator profile from request
+                evaluator_profile = request.evaluator_profile or "general"
+                
+                # Send status update with profile info
                 await websocket.send_json({
                     "type": MessageType.STATUS.value,
-                    "content": f"Starting content creation for: {request.topic}",
+                    "content": f"Starting content creation for: {request.topic} (Profile: {evaluator_profile})",
                     "timestamp": datetime.now().isoformat()
                 })
                 
+                # Create orchestrator with profile
                 workflow = WorkflowOrchestrator(
-                    evaluator_profile=request.evaluator_profile
+                    evaluator_profile=evaluator_profile
                 )
                     
                 quality = float(os.getenv("QUALITY_THRESHOLD", "75.0"))
+                
                 # Run the workflow with streaming
                 async for response in workflow.run_async(
                     topic=request.topic,
                     max_iterations=request.max_iterations,
-                    quality_threshold=quality
+                    quality_threshold=quality,
+                    evaluator_profile=evaluator_profile  # Pass profile
                 ):
                     # Send agent responses to client
                     await websocket.send_json({
@@ -110,7 +99,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         "timestamp": datetime.now().isoformat()
                     })
                     
-                    # Small delay for better streaming experience
                     await asyncio.sleep(0.1)
                 
                 # Send completion message
@@ -142,20 +130,3 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         if connection_id in active_connections:
             del active_connections[connection_id]
-
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Musequill server starting up...")
-    logger.info(f"Server running on {os.getenv('SERVER_HOST', 'localhost')}:{os.getenv('SERVER_PORT', 8000)}")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Musequill server shutting down...")
-    # Close all active WebSocket connections
-    for conn_id, websocket in active_connections.items():
-        try:
-            await websocket.close()
-        except:
-            pass
