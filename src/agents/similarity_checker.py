@@ -83,7 +83,7 @@ class SimilarityChecker:
                 overall_similarity=0.0,
                 is_unique=True,
                 unique_paragraphs=list(range(len(content.split("\n\n")))),
-                attempts_remaining=self.attempts_remaining
+                attempts_remaining=max(0, self.max_attempts - self._attempts)
             )
     
     def get_unique_paragraph_indices(self, content: str, matches: List[ParagraphMatch]) -> List[int]:

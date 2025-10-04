@@ -2,6 +2,7 @@ import logging
 import os
 import json
 from typing import Optional, List, Dict, Any, Tuple
+from dataclasses import asdict
 from langchain_core.tools import BaseTool, tool
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
@@ -12,6 +13,8 @@ from src.prompts.generator_prompts import FOCUSED_SYSTEM_PROMPT
 from src.storage.similarity_corpus import SimilarityCorpus
 from src.agents.similarity_checker import SimilarityChecker
 from src.agents.similarity_feedback import augment_prompt_with_feedback
+from src.agents.similarity_detector import RepetitionDetector, DecisionAction
+from src.agents.repetition_log import RepetitionLog
 
 
 logger = logging.getLogger(__name__)
@@ -29,13 +32,19 @@ class GeneratorAgent(BaseAgent):
         if session_id:
             self.similarity_corpus = SimilarityCorpus(session_id)
             self.similarity_checker = SimilarityChecker(session_id, self.similarity_corpus)
+            # Initialize enhanced repetition detector and logger
+            self.repetition_detector = RepetitionDetector(session_id, self.similarity_corpus)
+            self.repetition_log = RepetitionLog(session_id)
         else:
             self.similarity_corpus = None
             self.similarity_checker = None
+            self.repetition_detector = None
+            self.repetition_log = None
         
         # Load similarity configuration
         self.max_similarity_attempts = int(os.getenv("MAX_SIMILARITY_ATTEMPTS", "5"))
         self.similarity_relaxed_threshold = float(os.getenv("SIMILARITY_RELAXED_THRESHOLD", "0.90"))
+        self.use_enhanced_similarity = os.getenv("USE_ENHANCED_SIMILARITY", "true").lower() == "true"
         
         logger.info(f"GeneratorAgent initialized with model: {self.model} and {len(self.tools)} tools")
         
@@ -55,7 +64,10 @@ class GeneratorAgent(BaseAgent):
             state = {}
         
         # Generate unique content with similarity checking
-        if self.similarity_checker:
+        if self.use_enhanced_similarity and self.repetition_detector:
+            content, attempts, similarity_decision = await self._generate_with_enhanced_similarity(prompt, state)
+            logger.info(f"Generated content after {attempts} attempts using enhanced similarity")
+        elif self.similarity_checker:
             content, attempts = await self._generate_unique_content(prompt, state)
             logger.info(f"Generated unique content after {attempts} attempts")
         else:
@@ -75,6 +87,10 @@ class GeneratorAgent(BaseAgent):
             'last_followup_question': new_followup,
             'similarity_attempts': attempts
         }
+        
+        # Add similarity decision to state if available
+        if self.use_enhanced_similarity and 'similarity_decision' in locals():
+            state_updates['similarity_decision'] = similarity_decision
         
         return content, state_updates
     
@@ -235,7 +251,10 @@ class GeneratorAgent(BaseAgent):
             current_prompt = self._augment_prompt_with_similarity_feedback(prompt, result)
             
             # Increment similarity checker attempts
-            self.similarity_checker.increment_attempts()
+            if hasattr(self.similarity_checker, 'increment_attempts'):
+                self.similarity_checker.increment_attempts()
+            else:
+                self.similarity_checker._attempts += 1
         
         # Max attempts reached
         logger.warning(f"Max similarity attempts ({self.max_similarity_attempts}) reached")
@@ -261,3 +280,158 @@ class GeneratorAgent(BaseAgent):
             Augmented prompt with similarity feedback
         """
         return augment_prompt_with_feedback(original_prompt, result.feedback)
+    
+    async def _generate_with_enhanced_similarity(self, prompt: str, state: Dict[str, Any]) -> Tuple[str, int, Dict]:
+        """Generate content using the enhanced three-tier similarity detection system.
+        
+        Args:
+            prompt: The generation prompt
+            state: Current workflow state
+            
+        Returns:
+            Tuple of (content, attempts used, similarity decision)
+        """
+        attempts = 0
+        best_content = None
+        best_decision = None
+        current_prompt = prompt
+        
+        while attempts < self.max_similarity_attempts:
+            attempts += 1
+            
+            # Generate content
+            content = await self._process_without_similarity(current_prompt, state)
+            content = strip_think(content)
+            
+            # Get metadata for content
+            metadata = {
+                'agent_id': self.agent_id,
+                'iteration': state.get('iterations', 0),
+                'revision_number': state.get('generator_iterations', 0),
+                'section': 'generator_response',
+                'depth': state.get('current_depth_level', 1),
+                'content_type': 'paragraph'
+            }
+            
+            # Analyze with enhanced detector
+            decision = await self.repetition_detector.analyze_content(content, metadata)
+            
+            # Log the decision
+            # Convert dataclass to dict using asdict, handling enum properly
+            if hasattr(decision, '__dict__'):
+                decision_dict = asdict(decision)
+                # Convert enum to string if present
+                if 'action' in decision_dict and hasattr(decision_dict['action'], 'value'):
+                    decision_dict['action'] = decision_dict['action'].value
+            else:
+                decision_dict = decision
+            
+            self.repetition_log.log_decision(
+                decision=decision_dict,
+                original_text=content,
+                metadata=metadata
+            )
+            
+            logger.info(f"Similarity decision: {decision.action.value} - {decision.reason}")
+            logger.info(f"Tier: {decision.tier}, Score: {decision.similarity_score:.2%}")
+            
+            # Handle decision
+            if decision.action == DecisionAction.ACCEPT:
+                # Content accepted, store and return
+                await self.repetition_detector.store_content(content, None, metadata)
+                return content, attempts, decision
+            
+            elif decision.action == DecisionAction.FLAG:
+                # Content flagged but usable
+                logger.warning(f"Content flagged: {decision.recommendation}")
+                # Store as best attempt if better than previous
+                if best_content is None or decision.similarity_score < (best_decision.similarity_score if best_decision else 1.0):
+                    best_content = content
+                    best_decision = decision
+                
+                # Try to improve on next iteration
+                if attempts < self.max_similarity_attempts:
+                    # Augment prompt with specific guidance based on analysis
+                    feedback = self._create_enhanced_feedback(decision)
+                    current_prompt = f"{feedback}\n\nOriginal request: {prompt}"
+                else:
+                    # Out of attempts, use best flagged content
+                    await self.repetition_detector.store_content(best_content, None, metadata)
+                    return best_content, attempts, best_decision
+            
+            elif decision.action == DecisionAction.SKIP:
+                # Content should be skipped
+                logger.warning(f"Content skipped: {decision.reason}")
+                
+                # Create strong feedback for next attempt
+                if attempts < self.max_similarity_attempts:
+                    feedback = self._create_skip_feedback(decision)
+                    current_prompt = f"{feedback}\n\nOriginal request: {prompt}"
+                else:
+                    # Out of attempts, must use something
+                    if best_content:
+                        logger.warning("Using best flagged content after exhausting attempts")
+                        return best_content, attempts, best_decision
+                    else:
+                        # No good content generated, return with warning
+                        logger.error("No acceptable content generated")
+                        return content, attempts, decision
+        
+        # Should not reach here, but handle gracefully
+        logger.error("Unexpected exit from enhanced similarity generation")
+        return best_content or content, attempts, best_decision or decision
+    
+    def _create_enhanced_feedback(self, decision) -> str:
+        """Create feedback based on tier-specific analysis."""
+        feedback_parts = [
+            f"⚠️ Your content was flagged for review (Tier: {decision.tier})",
+            f"Similarity score: {decision.similarity_score:.1%}",
+            f"Reason: {decision.reason}",
+            ""
+        ]
+        
+        if decision.analysis:
+            analysis = decision.analysis
+            if 'novel_concepts' in analysis:
+                feedback_parts.append(f"Novel concepts found: {', '.join(analysis['novel_concepts'][:5])}")
+            if 'shared_concepts' in analysis:
+                feedback_parts.append(f"Overlapping concepts: {', '.join(analysis['shared_concepts'][:5])}")
+            if analysis.get('novelty_ratio'):
+                feedback_parts.append(f"Novelty ratio: {analysis['novelty_ratio']:.1%}")
+        
+        feedback_parts.extend([
+            "",
+            "Please regenerate with:",
+            "• More novel insights and perspectives",
+            "• Different examples or applications",
+            "• Unique analysis angles",
+            "• Fresh technical details"
+        ])
+        
+        return "\n".join(feedback_parts)
+    
+    def _create_skip_feedback(self, decision) -> str:
+        """Create strong feedback for skipped content."""
+        feedback_parts = [
+            f"🔴 Your content was rejected as too similar (Tier: {decision.tier})",
+            f"Similarity score: {decision.similarity_score:.1%}",
+            f"Reason: {decision.reason}",
+            "",
+            "CRITICAL: You must generate completely different content.",
+            "",
+            "Requirements:",
+            "• Explore entirely different aspects of the topic",
+            "• Use new examples not previously mentioned",
+            "• Introduce fresh concepts and perspectives",
+            "• Avoid repeating similar structures or patterns",
+            "• Focus on unique insights and analysis"
+        ]
+        
+        if decision.similar_to:
+            feedback_parts.extend([
+                "",
+                f"Your content was similar to content from: {decision.similar_to.get('section', 'previous section')}",
+                f"Preview of similar content: {decision.similar_to.get('preview', '')[:100]}..."
+            ])
+        
+        return "\n".join(feedback_parts)
