@@ -16,6 +16,8 @@ import json
 
 from src.agents.base import BaseAgent
 from src.agents.evaluator_profiles import EvaluatorProfileFactory, ProfileType
+from src.storage.similarity_corpus import SimilarityCorpus
+from datetime import datetime
 from src.agents.metrics import (
     calculate_cnr,
     calculate_claim_density,
@@ -67,7 +69,8 @@ class EvaluatorAgent(BaseAgent):
         model: Optional[str] = None,
         session_id: Optional[str] = None,
         llm_params: Optional[Dict[str, Any]] = None,
-        profile: ProfileType = "general"
+        profile: ProfileType = "general",
+        similarity_corpus: Optional[SimilarityCorpus] = None
     ):
         """
         Initialize evaluator with a specific profile.
@@ -78,6 +81,7 @@ class EvaluatorAgent(BaseAgent):
             session_id: Session identifier
             llm_params: LLM parameters
             profile: Content domain profile (scientific, technology, etc.)
+            similarity_corpus: Optional similarity corpus for storing best revisions
         """
         super().__init__(
             agent_id,
@@ -96,6 +100,12 @@ class EvaluatorAgent(BaseAgent):
         self.METRIC_CONFIG = profile_config['metric_config']
         self.TIER_THRESHOLDS = profile_config['tier_thresholds']
         self.CRITICAL_METRICS = profile_config.get('critical_metrics', [])
+        
+        # Initialize similarity corpus
+        if session_id and similarity_corpus is None:
+            self.similarity_corpus = SimilarityCorpus(session_id)
+        else:
+            self.similarity_corpus = similarity_corpus
         
         logger.info(
             f"EvaluatorAgent initialized with model: {self.model}, "
@@ -551,3 +561,36 @@ class EvaluatorAgent(BaseAgent):
             state['evaluation'] = result
         
         return result.detailed_feedback
+    
+    async def store_best_revision(self, content: str, agent_id: str, metadata: Dict[str, Any]):
+        """Store the best revision content in the similarity corpus.
+        
+        Args:
+            content: The content to store
+            agent_id: ID of the agent that generated this content
+            metadata: Additional metadata about the content
+        """
+        if not self.similarity_corpus:
+            logger.warning("No similarity corpus available for storing best revision")
+            return
+        
+        try:
+            # Prepare metadata for storage
+            storage_metadata = {
+                "agent_id": agent_id,
+                "quality_score": metadata.get("quality_score"),
+                "tier": metadata.get("tier"),
+                "iteration": metadata.get("iteration", 0),
+                "revision_number": metadata.get("revision_number", 0),
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            # Store in corpus
+            content_id = self.similarity_corpus.store_content(content, agent_id, storage_metadata)
+            
+            # Log success
+            preview = content[:100] + "..." if len(content) > 100 else content
+            logger.info(f"Stored best revision for {agent_id}: {content_id} (preview: {preview})")
+            
+        except Exception as e:
+            logger.error(f"Failed to store best revision: {str(e)}", exc_info=True)

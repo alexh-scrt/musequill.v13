@@ -386,10 +386,12 @@ class SummarizerAgent(BaseAgent):
         summary_parts = []
         
         # Header
-        summary_parts.append("=" * 80)
-        summary_parts.append(f"CONVERSATION SUMMARY: {original_topic}")
-        summary_parts.append("=" * 80)
-        summary_parts.append("")
+        summary_parts.append("-" * 60)
+        summary_parts.append('\n')
+        summary_parts.append(f"# CONVERSATION SUMMARY")
+        summary_parts.append('\n')
+        summary_parts.append(f"**Topic**: {original_topic}")
+        summary_parts.append('\n')
         
         # Overview
         summary_parts.append("## OVERVIEW")

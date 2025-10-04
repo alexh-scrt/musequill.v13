@@ -9,6 +9,9 @@ from src.agents.base import BaseAgent
 from src.utils.parsing import strip_think
 from src.states.topic_focused import TopicFocusedState
 from src.prompts.generator_prompts import FOCUSED_SYSTEM_PROMPT
+from src.storage.similarity_corpus import SimilarityCorpus
+from src.agents.similarity_checker import SimilarityChecker
+from src.agents.similarity_feedback import augment_prompt_with_feedback
 
 
 logger = logging.getLogger(__name__)
@@ -22,6 +25,18 @@ class GeneratorAgent(BaseAgent):
 
         self.agent = self._create_agent()
         
+        # Initialize similarity checking components
+        if session_id:
+            self.similarity_corpus = SimilarityCorpus(session_id)
+            self.similarity_checker = SimilarityChecker(session_id, self.similarity_corpus)
+        else:
+            self.similarity_corpus = None
+            self.similarity_checker = None
+        
+        # Load similarity configuration
+        self.max_similarity_attempts = int(os.getenv("MAX_SIMILARITY_ATTEMPTS", "5"))
+        self.similarity_relaxed_threshold = float(os.getenv("SIMILARITY_RELAXED_THRESHOLD", "0.90"))
+        
         logger.info(f"GeneratorAgent initialized with model: {self.model} and {len(self.tools)} tools")
         
    
@@ -34,17 +49,42 @@ class GeneratorAgent(BaseAgent):
         )
     
     async def process(self, prompt: str, state: TopicFocusedState = None) -> Tuple[str, Dict[str, Any]]:
-        """Two-phase processing to maintain topic focus"""
+        """Two-phase processing to maintain topic focus with similarity checking"""
         
         if state is None:
             state = {}
         
+        # Generate unique content with similarity checking
+        if self.similarity_checker:
+            content, attempts = await self._generate_unique_content(prompt, state)
+            logger.info(f"Generated unique content after {attempts} attempts")
+        else:
+            # Fallback to original logic if no similarity checking
+            content = await self._process_without_similarity(prompt, state)
+            attempts = 1
+        
+        # Extract and store the new follow-up question
+        new_followup = self._extract_followup_question(content)
+
+        # Update conversation state
+        await self.add_to_history("user", prompt)
+        await self.add_to_history("assistant", content)
+        
+        # Return response and state updates
+        state_updates = {
+            'last_followup_question': new_followup,
+            'similarity_attempts': attempts
+        }
+        
+        return content, state_updates
+    
+    async def _process_without_similarity(self, prompt: str, state: Dict[str, Any]) -> str:
+        """Original process logic without similarity checking"""
         original_topic = state.get('original_topic', prompt)
         depth_level = state.get('current_depth_level', 1)
         aspects_explored = state.get('aspects_explored', [])
         topic_summary = state.get('topic_summary', '')
         last_question = state.get('last_followup_question', '')
-        iteration = state.get('iterations', 0)
         
         # Get recent context but preserve original topic
         recent_context = await self.get_recent_context(n=4)
@@ -96,19 +136,7 @@ class GeneratorAgent(BaseAgent):
         else:
             combined_response = topic_advancement
         
-        # Extract and store the new follow-up question
-        new_followup = self._extract_followup_question(combined_response)
-
-        # Update conversation state
-        await self.add_to_history("user", prompt)
-        await self.add_to_history("assistant", combined_response)
-        
-        # Return response and state updates
-        state_updates = {
-            'last_followup_question': new_followup
-        }
-        
-        return combined_response, state_updates
+        return combined_response
 
     def _get_depth_guidance(self, level: int) -> str:
         """Provide guidance for what to explore at each depth level"""
@@ -161,3 +189,75 @@ class GeneratorAgent(BaseAgent):
             formatted.append(f"{role.upper()}: {content}")
         
         return "\n".join(formatted)
+    
+    async def _generate_unique_content(self, prompt: str, state: Dict[str, Any]) -> Tuple[str, int]:
+        """Generate content with similarity checking to ensure uniqueness.
+        
+        Args:
+            prompt: The generation prompt
+            state: Current workflow state
+            
+        Returns:
+            Tuple of (unique content, attempts used)
+        """
+        attempts = 0
+        best_content = None
+        best_similarity = 1.0
+        current_prompt = prompt
+        
+        while attempts < self.max_similarity_attempts:
+            attempts += 1
+            
+            # Generate content using existing logic
+            content = await self._process_without_similarity(current_prompt, state)
+            
+            # Strip any think tags
+            content = strip_think(content)
+            
+            # Check similarity
+            result = await self.similarity_checker.check_similarity(content)
+            
+            # Track best attempt
+            if result.overall_similarity < best_similarity:
+                best_content = content
+                best_similarity = result.overall_similarity
+            
+            # If unique, we're done
+            if result.is_unique:
+                logger.info(f"Content is unique with similarity {result.overall_similarity:.2%}")
+                return content, attempts
+            
+            # Not unique, log and augment prompt
+            logger.warning(f"Content similarity {result.overall_similarity:.2%} exceeds threshold "
+                         f"(attempt {attempts}/{self.max_similarity_attempts})")
+            
+            # Augment prompt with feedback for next attempt
+            current_prompt = self._augment_prompt_with_similarity_feedback(prompt, result)
+            
+            # Increment similarity checker attempts
+            self.similarity_checker.increment_attempts()
+        
+        # Max attempts reached
+        logger.warning(f"Max similarity attempts ({self.max_similarity_attempts}) reached")
+        
+        # Check if best content meets relaxed threshold
+        if best_similarity < self.similarity_relaxed_threshold:
+            logger.info(f"Accepting content with relaxed threshold "
+                       f"(similarity: {best_similarity:.2%} < {self.similarity_relaxed_threshold:.2%})")
+        else:
+            logger.error(f"Topic may be exhausted - best similarity {best_similarity:.2%} "
+                        f"exceeds relaxed threshold {self.similarity_relaxed_threshold:.2%}")
+        
+        return best_content, attempts
+    
+    def _augment_prompt_with_similarity_feedback(self, original_prompt: str, result) -> str:
+        """Augment prompt with similarity feedback to encourage unique content.
+        
+        Args:
+            original_prompt: The original generation prompt
+            result: SimilarityResult with feedback
+            
+        Returns:
+            Augmented prompt with similarity feedback
+        """
+        return augment_prompt_with_feedback(original_prompt, result.feedback)

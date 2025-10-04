@@ -20,6 +20,7 @@ from src.agents.generator import GeneratorAgent
 from src.agents.discriminator import DiscriminatorAgent
 from src.agents.evaluator import EvaluatorAgent
 from src.agents.summarizer import SummarizerAgent
+from src.storage.similarity_corpus import SimilarityCorpus
 from src.agents.profiles import GeneratorProfileFactory, DiscriminatorProfileFactory
 
 from src.server.models import AgentResponse
@@ -38,6 +39,9 @@ class WorkflowOrchestrator:
     def __init__(self, session_id: Optional[str] = None, generator_profile: str = "balanced", discriminator_profile: str = "balanced", evaluator_profile: str = "general"):
         self.session_id = session_id or f"session_{uuid.uuid4().hex[:12]}"
         
+        # Create shared similarity corpus for all agents
+        self.similarity_corpus = SimilarityCorpus(self.session_id)
+        
         # Get LLM parameters from profile factories
         gen_params = GeneratorProfileFactory.get(generator_profile)
         disc_params = DiscriminatorProfileFactory.get(discriminator_profile)
@@ -54,14 +58,17 @@ class WorkflowOrchestrator:
             session_id=self.session_id, 
             llm_params=disc_params)        
 
+        # Pass shared corpus to evaluators
         self.generator_evaluator = EvaluatorAgent(
             session_id=self.session_id,
-            profile=evaluator_profile
+            profile=evaluator_profile,
+            similarity_corpus=self.similarity_corpus
         )
 
         self.discriminator_evaluator = EvaluatorAgent(
             session_id=self.session_id,
-            profile=evaluator_profile
+            profile=evaluator_profile,
+            similarity_corpus=self.similarity_corpus
         )
 
         self.summarizer = SummarizerAgent(
@@ -120,6 +127,14 @@ class WorkflowOrchestrator:
             self._log_queue.put_nowait(None)
             await self._log_task
             logger.info(f"✅ Conversation log written to: {self._log_filepath}")
+        
+        # Clean up similarity corpus
+        if hasattr(self, 'similarity_corpus'):
+            try:
+                self.similarity_corpus.clear_session()
+                logger.info(f"✅ Similarity corpus cleaned up for session {self.session_id}")
+            except Exception as e:
+                logger.error(f"Error cleaning up similarity corpus: {e}")
     
     def _build_graph(self):
         """Build the clean workflow graph with explicit phase transitions"""
@@ -234,6 +249,19 @@ class WorkflowOrchestrator:
             
             logger.info(f"Selecting best generator content with score {best_score:.1f}")
             
+            # Store best revision in similarity corpus
+            if best_content:
+                await self.generator_evaluator.store_best_revision(
+                    content=best_content,
+                    agent_id="generator",
+                    metadata={
+                        "quality_score": best_score,
+                        "tier": evaluation_result.tier,
+                        "iteration": state.get("iterations", 0),
+                        "revision_number": generator_iterations
+                    }
+                )
+            
             return {
                 "generator_revisions": generator_revisions,
                 "generator_iterations": generator_iterations,
@@ -304,6 +332,19 @@ class WorkflowOrchestrator:
             logger.info(f"✅ Quality threshold met ({quality_score:.1f} >= {QUALITY_THRESHOLD})")
         else:
             logger.info(f"⚠️ Max refinements reached ({MAX_REFINEMENT_ITERATIONS}), using best score: {best_score:.1f}")
+        
+        # Store best revision in similarity corpus
+        if best_response:
+            await self.discriminator_evaluator.store_best_revision(
+                content=best_response,
+                agent_id="discriminator",
+                metadata={
+                    "quality_score": best_score,
+                    "tier": evaluation_result.tier,
+                    "iteration": iterations,
+                    "revision_number": discriminator_iterations
+                }
+            )
         
         # Now decide routing based on conversation iterations
         if iterations < max_iterations:

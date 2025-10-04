@@ -9,6 +9,9 @@ from src.agents.base import BaseAgent
 from src.utils.parsing import strip_think
 from src.prompts.discriminator_prompts import FOCUSED_SYSTEM_PROMPT
 from src.states.topic_focused import TopicFocusedState
+from src.storage.similarity_corpus import SimilarityCorpus
+from src.agents.similarity_checker import SimilarityChecker
+from src.agents.similarity_feedback import augment_prompt_with_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +23,18 @@ class DiscriminatorAgent(BaseAgent):
         super().__init__(agent_id, web_search=True, model=model, session_id=session_id, llm_params=llm_params)
                 
         self.agent = self._create_agent()
+        
+        # Initialize similarity checking components
+        if session_id:
+            self.similarity_corpus = SimilarityCorpus(session_id)
+            self.similarity_checker = SimilarityChecker(session_id, self.similarity_corpus)
+        else:
+            self.similarity_corpus = None
+            self.similarity_checker = None
+        
+        # Load similarity configuration
+        self.max_similarity_attempts = int(os.getenv("MAX_SIMILARITY_ATTEMPTS", "5"))
+        self.similarity_relaxed_threshold = float(os.getenv("SIMILARITY_RELAXED_THRESHOLD", "0.90"))
         
         logger.info(f"DiscriminatorAgent initialized with model: {self.model} and {len(self.tools)} tools")
         
@@ -33,17 +48,49 @@ class DiscriminatorAgent(BaseAgent):
         )
     
     async def process(self, generator_response: str, state: TopicFocusedState = None) -> Tuple[str, Dict[str, Any]]:
-        """Three-phase processing: answer last question, deepen topic, extract new question"""
+        """Three-phase processing with similarity checking"""
         
         if state is None:
             state = {}
         
+        # Store generator response in state for similarity checking
+        state['generator_response'] = generator_response
+        
+        # Generate unique content with similarity checking
+        if self.similarity_checker:
+            content, attempts = await self._generate_unique_content(generator_response, state)
+            logger.info(f"Generated unique discriminator response after {attempts} attempts")
+        else:
+            # Fallback to original logic if no similarity checking
+            content = await self._process_without_similarity(generator_response, state)
+            attempts = 1
+        
+        # Extract and store new follow-up question
+        new_followup = self._extract_followup_question(content)
+        
+        await self.add_to_history("discriminator", content)
+        
+        # Return response and state updates
+        iteration = state.get('iterations', 0)
+        state_updates = {
+            'last_followup_question': new_followup,
+            'iterations': iteration + 1,
+            'similarity_attempts': attempts
+        }
+        
+        if iteration + 1 >= MAX_ITERATIONS:
+            logger.warning(f"⚠️ Maximum iterations {MAX_ITERATIONS} reached in DiscriminatorAgent")
+            state_updates['STOP'] = True
+
+        return content, state_updates
+    
+    async def _process_without_similarity(self, generator_response: str, state: Dict[str, Any]) -> str:
+        """Original process logic without similarity checking"""
         original_topic = state.get('original_topic', 'unknown topic')
         depth_level = state.get('current_depth_level', 1)
         aspects_explored = state.get('aspects_explored', [])
         topic_summary = state.get('topic_summary', '')
         last_question = state.get('last_followup_question', '')
-        iteration = state.get('iterations', 0)
         recent_context = await self.get_recent_context(n=6)
         
         # Phase 1: Answer last question if present
@@ -107,22 +154,7 @@ class DiscriminatorAgent(BaseAgent):
         else:
             combined_response = topic_advancement
         
-        # Extract and store new follow-up question
-        new_followup = self._extract_followup_question(combined_response)
-        
-        await self.add_to_history("discriminator", combined_response)
-        
-        # Return response and state updates
-        state_updates = {
-            'last_followup_question': new_followup,
-            'iterations': iteration + 1,
-        }
-        
-        if iteration + 1 >= MAX_ITERATIONS:
-            logger.warning(f"⚠️ Maximum iterations {MAX_ITERATIONS} reached in DiscriminatorAgent")
-            state_updates['STOP'] = True
-
-        return combined_response, state_updates
+        return combined_response
     
     def _extract_followup_question(self, response: str) -> str:
         """Extract the follow-up question from the response"""
@@ -164,3 +196,82 @@ class DiscriminatorAgent(BaseAgent):
             formatted.append(f"{role.upper()}: {content}")
         
         return "\n".join(formatted)
+    
+    async def _generate_unique_content(self, generator_response: str, state: Dict[str, Any]) -> Tuple[str, int]:
+        """Generate content with similarity checking to ensure uniqueness.
+        
+        Args:
+            generator_response: The generator's response to discriminate against
+            state: Current workflow state
+            
+        Returns:
+            Tuple of (unique content, attempts used)
+        """
+        attempts = 0
+        best_content = None
+        best_similarity = 1.0
+        current_state = state.copy()
+        
+        while attempts < self.max_similarity_attempts:
+            attempts += 1
+            
+            # Generate content using existing logic
+            content = await self._process_without_similarity(generator_response, current_state)
+            
+            # Strip any think tags
+            content = strip_think(content)
+            
+            # Check similarity
+            result = await self.similarity_checker.check_similarity(content)
+            
+            # Track best attempt
+            if result.overall_similarity < best_similarity:
+                best_content = content
+                best_similarity = result.overall_similarity
+            
+            # If unique, we're done
+            if result.is_unique:
+                logger.info(f"Discriminator content is unique with similarity {result.overall_similarity:.2%}")
+                return content, attempts
+            
+            # Not unique, log and augment state for next attempt
+            logger.warning(f"Discriminator content similarity {result.overall_similarity:.2%} exceeds threshold "
+                         f"(attempt {attempts}/{self.max_similarity_attempts})")
+            
+            # Augment state with feedback for next attempt
+            current_state = self._augment_state_with_similarity_feedback(state, result)
+            
+            # Increment similarity checker attempts
+            self.similarity_checker.increment_attempts()
+        
+        # Max attempts reached
+        logger.warning(f"Discriminator max similarity attempts ({self.max_similarity_attempts}) reached")
+        
+        # Check if best content meets relaxed threshold
+        if best_similarity < self.similarity_relaxed_threshold:
+            logger.info(f"Accepting discriminator content with relaxed threshold "
+                       f"(similarity: {best_similarity:.2%} < {self.similarity_relaxed_threshold:.2%})")
+        else:
+            logger.error(f"Discriminator topic may be exhausted - best similarity {best_similarity:.2%} "
+                        f"exceeds relaxed threshold {self.similarity_relaxed_threshold:.2%}")
+        
+        return best_content, attempts
+    
+    def _augment_state_with_similarity_feedback(self, original_state: Dict[str, Any], result) -> Dict[str, Any]:
+        """Augment state with similarity feedback to encourage unique content.
+        
+        Args:
+            original_state: The original state
+            result: SimilarityResult with feedback
+            
+        Returns:
+            Augmented state with similarity feedback embedded
+        """
+        augmented_state = original_state.copy()
+        
+        # Add similarity feedback to topic summary to influence generation
+        if result.feedback:
+            feedback_note = f"\n\nIMPORTANT: Avoid repeating these similar points:\n{result.feedback[:500]}"
+            augmented_state['topic_summary'] = augmented_state.get('topic_summary', '') + feedback_note
+        
+        return augmented_state
