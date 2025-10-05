@@ -1,5 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import json
 import logging
@@ -10,11 +11,24 @@ import os
 from src.server.models import WebSocketMessage, MessageType, ContentRequest
 from src.workflow.orchestrator import WorkflowOrchestrator
 from src.llm.ollama_client import OllamaClient
+from src.server.profile_endpoints import router as profile_router
 
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Musequill Content Creator")
+
+# Add CORS middleware for browser access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include profile generation endpoints
+app.include_router(profile_router)
 
 # Store active connections
 active_connections: Dict[str, WebSocket] = {}

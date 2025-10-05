@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-Musequill CLI Client with Evaluator Profile Support
+Musequill CLI Client with Profile-Aware and Depth Support
 
 Usage:
+    # Use WebSocket endpoint (original):
     python client.py "Topic" --profile technology
-    python client.py "Topic" --profile scientific
-    python client.py "Topic" --list-profiles
+    
+    # Use new profile-aware HTTP endpoint:
+    python client.py "Topic" --profile scientific --depth 3 --use-http
+    python client.py "Topic" --profile popular_science --single-depth 2 --use-http
 """
 
 import asyncio
 import json
 import argparse
 import sys
+import httpx
 from datetime import datetime
 from websockets import connect
 from websockets.exceptions import ConnectionClosed
@@ -88,18 +92,18 @@ async def receive_messages(websocket):
         print(f"\n❌ Error receiving messages: {e}\n", file=sys.stderr)
 
 
-async def run_client(
+async def run_websocket_client(
     topic: str, 
     max_iterations: int, 
     server_url: str,
     profile: str
 ):
-    """Run the client with specified parameters"""
+    """Run the WebSocket client (original orchestrator)"""
     print(f"\n🔌 Connecting to {server_url}...\n")
     
     try:
         async with connect(server_url) as websocket:
-            print("✅ Connected to Musequill server\n")
+            print("✅ Connected to Musequill WebSocket server\n")
             
             await send_content_request(websocket, topic, max_iterations, profile)
             
@@ -115,6 +119,110 @@ async def run_client(
     except Exception as e:
         print(f"❌ Unexpected error: {e}\n", file=sys.stderr)
         sys.exit(1)
+
+
+async def run_http_client(
+    topic: str,
+    profile: str,
+    max_depth: int,
+    single_depth: int,
+    server_base_url: str,
+    stream: bool = False
+):
+    """Run the HTTP client for profile-aware generation"""
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        # Build request payload
+        payload = {
+            "topic": topic,
+            "profile": profile,
+            "max_depth": max_depth,
+            "stream": stream
+        }
+        
+        if single_depth:
+            payload["single_depth"] = single_depth
+        
+        # Determine endpoint
+        endpoint = f"{server_base_url}/api/profile/generate"
+        if stream:
+            endpoint = f"{server_base_url}/api/profile/generate/stream"
+        
+        print(f"\n🔌 Sending request to {endpoint}...\n")
+        
+        try:
+            if stream:
+                # Streaming response
+                async with client.stream("POST", endpoint, json=payload) as response:
+                    response.raise_for_status()
+                    print("✅ Connected to profile generation endpoint (streaming)\n")
+                    
+                    async for line in response.aiter_lines():
+                        if line:
+                            data = json.loads(line)
+                            msg_type = data.get("type")
+                            
+                            if msg_type == "status":
+                                print(f"🔔 {data.get('message', '')}")
+                            elif msg_type == "progress":
+                                depth = data.get("depth")
+                                total = data.get("total", max_depth)
+                                print(f"⏳ Generating depth {depth}/{total}...")
+                            elif msg_type == "content":
+                                depth = data.get("depth")
+                                content = data.get("content", "")
+                                metadata = data.get("metadata", {})
+                                print(f"\n{'='*80}")
+                                print(f"📝 DEPTH {depth} | Decision: {metadata.get('decision', 'UNKNOWN')}")
+                                print(f"{'='*80}")
+                                print(content[:500] if len(content) > 500 else content)
+                                if len(content) > 500:
+                                    print("... [content truncated for display]")
+                                print(f"{'='*80}\n")
+                            elif msg_type == "complete":
+                                print(f"\n✅ {data.get('message', 'Generation complete')}")
+                            elif msg_type == "error":
+                                print(f"\n❌ ERROR: {data.get('error', 'Unknown error')}")
+            else:
+                # Regular response
+                response = await client.post(endpoint, json=payload)
+                response.raise_for_status()
+                
+                result = response.json()
+                print("✅ Generation complete\n")
+                
+                # Display results
+                print(f"📄 Session ID: {result['session_id']}")
+                print(f"📊 Profile: {result['profile']}")
+                print(f"📚 Depths generated: {result['depths_generated']}")
+                print(f"⏱️  Generation time: {result['generation_time']:.2f} seconds")
+                
+                # Display content for each depth
+                for depth in sorted(result['depths_generated']):
+                    content = result['content'][str(depth)]
+                    metadata = result['metadata'][str(depth)]
+                    
+                    print(f"\n{'='*80}")
+                    print(f"📝 DEPTH {depth}")
+                    print(f"   Decision: {metadata.get('decision', 'UNKNOWN')}")
+                    print(f"   Attempts: {metadata.get('attempts', 0)}")
+                    if 'similarity_score' in metadata:
+                        print(f"   Similarity: {metadata['similarity_score']:.2%}")
+                    print(f"{'='*80}")
+                    print(content[:500] if len(content) > 500 else content)
+                    if len(content) > 500:
+                        print("... [content truncated for display]")
+                    print(f"{'='*80}\n")
+                    
+        except httpx.HTTPStatusError as e:
+            print(f"❌ HTTP Error {e.response.status_code}: {e.response.text}", file=sys.stderr)
+            sys.exit(1)
+        except httpx.ConnectError:
+            print(f"❌ Could not connect to {server_base_url}", file=sys.stderr)
+            print("   Make sure the server is running: python main.py\n", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"❌ Unexpected error: {e}\n", file=sys.stderr)
+            sys.exit(1)
 
 
 def list_profiles():
@@ -140,40 +248,35 @@ def list_profiles():
             print(f"   Error loading details: {e}")
     
     print("\n" + "="*80)
+    print("\nNote: For profile-aware generation with depth control, use --use-http flag")
+    print("Profile-aware profiles: scientific, popular_science, educational")
     print()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Musequill WebSocket CLI Client with Evaluator Profiles",
+        description="Musequill CLI Client with Profile and Depth Support",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # List available profiles
+  # Original WebSocket orchestrator:
+  python client.py "Topic about AI" --profile technology
+  
+  # New profile-aware HTTP endpoint with depth control:
+  python client.py "Quantum computing" --profile scientific --depth 3 --use-http
+  python client.py "Black holes" --profile popular_science --single-depth 2 --use-http
+  python client.py "Entropy" --profile educational --depth 2 --use-http --stream
+  
+  # List available profiles:
   python client.py --list-profiles
   
-  # Use technology profile for tech content
-  python client.py "Review of the new M4 MacBook Pro" --profile technology
+Available Profiles (WebSocket):
+  - scientific, popular_science, technology, investment, general, creative
   
-  # Use scientific profile for research content
-  python client.py "Quantum computing advances" --profile scientific
-  
-  # Use investment profile for financial analysis
-  python client.py "Analysis of tech sector valuations" --profile investment
-  
-  # Use popular science for accessible explanations
-  python client.py "How does CRISPR gene editing work?" --profile popular_science
-  
-  # Use creative profile for storytelling
-  python client.py "Write a sci-fi story about AI" --profile creative
-  
-Available Profiles:
-  - scientific: Rigorous academic/research content
-  - popular_science: Accessible science communication
-  - technology: Tech reviews and tutorials
-  - investment: Financial analysis and insights
-  - general: Balanced, broad-audience content (default)
-  - creative: Narrative and storytelling
+Available Profiles (HTTP with --use-http):
+  - scientific: Technical content with equations and citations
+  - popular_science: Accessible content without jargon
+  - educational: Progressive learning with examples
         """
     )
     
@@ -185,16 +288,35 @@ Available Profiles:
     
     parser.add_argument(
         "--profile",
-        choices=[
-            "scientific",
-            "popular_science",
-            "technology",
-            "investment",
-            "general",
-            "creative"
-        ],
         default="general",
-        help="Evaluator profile to use (default: general)"
+        help="Content profile to use (default: general)"
+    )
+    
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=3,
+        choices=[1, 2, 3],
+        help="Maximum depth level for generation (HTTP only, default: 3)"
+    )
+    
+    parser.add_argument(
+        "--single-depth",
+        type=int,
+        choices=[1, 2, 3],
+        help="Generate only a single depth level (HTTP only)"
+    )
+    
+    parser.add_argument(
+        "--use-http",
+        action="store_true",
+        help="Use HTTP endpoint for profile-aware generation instead of WebSocket"
+    )
+    
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Use streaming response (HTTP only)"
     )
     
     parser.add_argument(
@@ -207,13 +329,13 @@ Available Profiles:
         "--max-iterations",
         type=int,
         default=3,
-        help="Maximum number of refinement iterations (default: 3)"
+        help="Maximum number of refinement iterations (WebSocket only, default: 3)"
     )
     
     parser.add_argument(
         "--server",
-        default="ws://localhost:8080/ws",
-        help="WebSocket server URL (default: ws://localhost:8080/ws)"
+        default="localhost:8080",
+        help="Server address (default: localhost:8080)"
     )
     
     args = parser.parse_args()
@@ -231,20 +353,55 @@ Available Profiles:
     print(" 🎨 MUSEQUILL CLI CLIENT")
     print("="*80)
     print(f"\n📋 Topic: {args.topic}")
-    print(f"📊 Evaluator Profile: {args.profile}")
-    print(f"🔄 Max Iterations: {args.max_iterations}")
-    print()
+    print(f"📊 Profile: {args.profile}")
     
-    try:
-        asyncio.run(run_client(
-            args.topic, 
-            args.max_iterations, 
-            args.server,
-            args.profile
-        ))
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Interrupted by user\n")
-        sys.exit(0)
+    if args.use_http:
+        # Use HTTP endpoint for profile-aware generation
+        print(f"🔧 Mode: Profile-Aware Generation (HTTP)")
+        if args.single_depth:
+            print(f"📚 Single Depth: {args.single_depth}")
+        else:
+            print(f"📚 Max Depth: {args.depth}")
+        print(f"🔄 Streaming: {args.stream}")
+        
+        # Validate profile for HTTP endpoint
+        valid_http_profiles = ["scientific", "popular_science", "educational"]
+        if args.profile not in valid_http_profiles:
+            print(f"\n⚠️  Warning: Profile '{args.profile}' may not be available for HTTP endpoint")
+            print(f"   Available profiles: {', '.join(valid_http_profiles)}")
+            print("   Attempting anyway...\n")
+        
+        server_base_url = f"http://{args.server}"
+        
+        try:
+            asyncio.run(run_http_client(
+                args.topic,
+                args.profile,
+                args.depth,
+                args.single_depth,
+                server_base_url,
+                args.stream
+            ))
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Interrupted by user\n")
+            sys.exit(0)
+    else:
+        # Use WebSocket endpoint (original orchestrator)
+        print(f"🔧 Mode: Orchestrator Workflow (WebSocket)")
+        print(f"🔄 Max Iterations: {args.max_iterations}")
+        
+        server_url = f"ws://{args.server}/ws"
+        
+        try:
+            asyncio.run(run_websocket_client(
+                args.topic, 
+                args.max_iterations, 
+                server_url,
+                args.profile
+            ))
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Interrupted by user\n")
+            sys.exit(0)
 
 
 if __name__ == "__main__":

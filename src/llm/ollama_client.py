@@ -22,8 +22,8 @@ class OllamaClient:
         self.async_client = AsyncClient(host=self.base_url)
         
         # Default models
-        self.writer_model = os.getenv("WRITER_MODEL", "llama3.3:70b")
-        self.editor_model = os.getenv("EDITOR_MODEL", "qwen3:32b")
+        self.writer_model = os.getenv("WRITER_MODEL", "qwen3:8b")
+        self.editor_model = os.getenv("EDITOR_MODEL", "qwen3:8b")
         
         logger.info(f"Initialized Ollama client with base URL: {self.base_url}")
     

@@ -15,6 +15,7 @@ class MessageType(str, Enum):
     STATUS = "status"
     ERROR = "error"
     STOP = "stop"
+    COMPLETE = "complete"
 
 
 class WebSocketMessage(BaseModel):

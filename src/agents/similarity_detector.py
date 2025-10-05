@@ -103,10 +103,34 @@ class RepetitionDetector:
         self.session_id = session_id
         self.corpus = corpus or SimilarityCorpus(session_id)
         
-        # Load thresholds from environment
-        self.IDENTICAL_THRESHOLD = float(os.getenv("SIMILARITY_IDENTICAL_THRESHOLD", "0.90"))
-        self.VERY_SIMILAR_THRESHOLD = float(os.getenv("SIMILARITY_VERY_SIMILAR_THRESHOLD", "0.75"))
-        self.SIMILAR_THRESHOLD = float(os.getenv("SIMILARITY_SIMILAR_THRESHOLD", "0.60"))
+        # Load default thresholds from environment
+        self.DEFAULT_IDENTICAL_THRESHOLD = float(os.getenv("SIMILARITY_IDENTICAL_THRESHOLD", "0.90"))
+        self.DEFAULT_VERY_SIMILAR_THRESHOLD = float(os.getenv("SIMILARITY_VERY_SIMILAR_THRESHOLD", "0.75"))
+        self.DEFAULT_SIMILAR_THRESHOLD = float(os.getenv("SIMILARITY_SIMILAR_THRESHOLD", "0.60"))
+        
+        # Profile-specific thresholds
+        self.PROFILE_THRESHOLDS = {
+            'scientific': {
+                'IDENTICAL': 0.92,  # More strict - formalism should be precise
+                'VERY_SIMILAR': 0.78,
+                'SIMILAR': 0.65
+            },
+            'popular_science': {
+                'IDENTICAL': 0.88,  # Slightly more lenient - some repetition of analogies OK
+                'VERY_SIMILAR': 0.75,
+                'SIMILAR': 0.60
+            },
+            'educational': {
+                'IDENTICAL': 0.90,
+                'VERY_SIMILAR': 0.76,
+                'SIMILAR': 0.62
+            }
+        }
+        
+        # Set default thresholds (can be overridden per analysis)
+        self.IDENTICAL_THRESHOLD = self.DEFAULT_IDENTICAL_THRESHOLD
+        self.VERY_SIMILAR_THRESHOLD = self.DEFAULT_VERY_SIMILAR_THRESHOLD
+        self.SIMILAR_THRESHOLD = self.DEFAULT_SIMILAR_THRESHOLD
         
         # Information gain requirements
         self.MIN_NOVELTY_RATIO = float(os.getenv("MIN_NOVELTY_RATIO", "0.40"))
@@ -120,14 +144,15 @@ class RepetitionDetector:
         self.embeddings_cache = {}
         
         logger.info(f"RepetitionDetector initialized for session {session_id}")
-        logger.info(f"Thresholds: Identical={self.IDENTICAL_THRESHOLD}, "
-                   f"Very Similar={self.VERY_SIMILAR_THRESHOLD}, "
-                   f"Similar={self.SIMILAR_THRESHOLD}")
+        logger.info(f"Default Thresholds: Identical={self.DEFAULT_IDENTICAL_THRESHOLD}, "
+                   f"Very Similar={self.DEFAULT_VERY_SIMILAR_THRESHOLD}, "
+                   f"Similar={self.DEFAULT_SIMILAR_THRESHOLD}")
     
     async def analyze_content(
         self,
         text: str,
-        metadata: Dict[str, Any]
+        metadata: Dict[str, Any],
+        profile: Optional[str] = None
     ) -> SimilarityDecision:
         """
         Analyze content for similarity and make a decision.
@@ -135,11 +160,24 @@ class RepetitionDetector:
         Args:
             text: The content to analyze
             metadata: Content metadata (section, depth, type, etc.)
+            profile: Optional profile name for profile-specific thresholds
             
         Returns:
             SimilarityDecision with action and reasoning
         """
-        logger.debug(f"Analyzing content with metadata: {metadata}")
+        logger.debug(f"Analyzing content with metadata: {metadata}, profile: {profile}")
+        
+        # Update thresholds based on profile if provided
+        if profile and profile in self.PROFILE_THRESHOLDS:
+            self.IDENTICAL_THRESHOLD = self.PROFILE_THRESHOLDS[profile]['IDENTICAL']
+            self.VERY_SIMILAR_THRESHOLD = self.PROFILE_THRESHOLDS[profile]['VERY_SIMILAR']
+            self.SIMILAR_THRESHOLD = self.PROFILE_THRESHOLDS[profile]['SIMILAR']
+            logger.debug(f"Using {profile} profile thresholds")
+        else:
+            # Use default thresholds
+            self.IDENTICAL_THRESHOLD = self.DEFAULT_IDENTICAL_THRESHOLD
+            self.VERY_SIMILAR_THRESHOLD = self.DEFAULT_VERY_SIMILAR_THRESHOLD
+            self.SIMILAR_THRESHOLD = self.DEFAULT_SIMILAR_THRESHOLD
         
         # Search for similar content in corpus
         matches = self.corpus.search_similar_content(text)
@@ -151,7 +189,7 @@ class RepetitionDetector:
                 reason="No similar content found",
                 similarity_score=0.0,
                 tier="NONE",
-                details={"matches": 0}
+                details={"matches": 0, "profile": profile}
             )
         
         # Find the most similar match
@@ -172,17 +210,17 @@ class RepetitionDetector:
         if similarity_score >= self.IDENTICAL_THRESHOLD:
             return await self._handle_tier1_identical(
                 text, most_similar.matched_paragraph, similarity_score,
-                metadata, similar_metadata
+                metadata, similar_metadata, profile
             )
         elif similarity_score >= self.VERY_SIMILAR_THRESHOLD:
             return await self._handle_tier2_very_similar(
                 text, most_similar.matched_paragraph, similarity_score,
-                metadata, similar_metadata
+                metadata, similar_metadata, profile
             )
         elif similarity_score >= self.SIMILAR_THRESHOLD:
             return await self._handle_tier3_somewhat_similar(
                 text, most_similar.matched_paragraph, similarity_score,
-                metadata, similar_metadata
+                metadata, similar_metadata, profile
             )
         else:
             return SimilarityDecision(
@@ -190,7 +228,7 @@ class RepetitionDetector:
                 reason="Similarity below threshold",
                 similarity_score=similarity_score,
                 tier="LOW",
-                details={"matches": len(matches)}
+                details={"matches": len(matches), "profile": profile}
             )
     
     async def _handle_tier1_identical(
@@ -199,7 +237,8 @@ class RepetitionDetector:
         similar_content: str,
         score: float,
         metadata: Dict[str, Any],
-        similar_metadata: Dict[str, Any]
+        similar_metadata: Dict[str, Any],
+        profile: Optional[str] = None
     ) -> SimilarityDecision:
         """
         Handle near-identical content (≥0.90 similarity).
@@ -259,7 +298,7 @@ class RepetitionDetector:
                 metadata.get('section') != similar_metadata.get('section')):
                 # Different context, downgrade to Tier 2 analysis
                 return await self._handle_tier2_very_similar(
-                    text, similar_content, score, metadata, similar_metadata
+                    text, similar_content, score, metadata, similar_metadata, profile
                 )
             else:
                 # Same context, very similar - probably redundant
@@ -288,7 +327,7 @@ class RepetitionDetector:
             reason="High similarity detected, review recommended",
             similarity_score=score,
             tier="TIER_1",
-            details={"content_type": content_type},
+            details={"content_type": content_type, "profile": profile},
             similar_to={
                 "section": similar_metadata.get('section', 'unknown'),
                 "depth": similar_metadata.get('depth', 0),
@@ -303,7 +342,8 @@ class RepetitionDetector:
         similar_content: str,
         score: float,
         metadata: Dict[str, Any],
-        similar_metadata: Dict[str, Any]
+        similar_metadata: Dict[str, Any],
+        profile: Optional[str] = None
     ) -> SimilarityDecision:
         """
         Semantic analysis for very similar content (0.75-0.90).
@@ -392,7 +432,8 @@ class RepetitionDetector:
         similar_content: str,
         score: float,
         metadata: Dict[str, Any],
-        similar_metadata: Dict[str, Any]
+        similar_metadata: Dict[str, Any],
+        profile: Optional[str] = None
     ) -> SimilarityDecision:
         """
         Information gain assessment for moderate similarity (0.60-0.75).

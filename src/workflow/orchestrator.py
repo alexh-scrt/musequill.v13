@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "25"))
 QUALITY_THRESHOLD = float(os.getenv("QUALITY_THRESHOLD", "60.0"))
 MAX_REFINEMENT_ITERATIONS = int(os.getenv("MAX_REFINEMENT_ITERATIONS", "3"))
+RECURSION_LIMIT= int(os.getenv("RECURSION_LIMIT", "125"))
 
 class WorkflowOrchestrator:
     """Orchestrate collaboration between agents using clean LangGraph architecture"""
@@ -543,7 +544,7 @@ class WorkflowOrchestrator:
             # Create config with thread_id and increased recursion limit
             config = {
                 "configurable": {"thread_id": f"orch_{topic[:20]}"},
-                "recursion_limit": 125
+                "recursion_limit": RECURSION_LIMIT
             }
             
             # Stream events from the graph and capture final state

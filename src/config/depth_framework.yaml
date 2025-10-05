@@ -1,0 +1,79 @@
+depth_framework:
+  depth_1:
+    universal_purpose: "Introduce and explain WHAT"
+    question_pattern: "What is {topic}?"
+    information_density: "low"
+    abstraction_level: "concrete"
+    
+    constraints:
+      max_paragraphs: 5
+      focus: "core_concepts_introduction"
+      avoid: "deep_technical_details"
+    
+    examples:
+      good:
+        - "Uses clear analogies to explain concepts"
+        - "Defines key terms in simple language"
+        - "Provides motivation for why topic matters"
+      bad:
+        - "Jumps into derivations without context"
+        - "Uses jargon without explanation"
+        - "Assumes prior knowledge"
+
+  depth_2:
+    universal_purpose: "Explain and formalize HOW"
+    question_pattern: "How does {topic} work?"
+    information_density: "medium"
+    abstraction_level: "formal"
+    
+    constraints:
+      min_paragraphs: 4
+      focus: "mechanisms_and_formalization"
+      avoid: "redundant_definitions_from_depth_1"
+    
+    context_usage:
+      previous_depths: [1]
+      instructions: |
+        BUILD ON depth 1 concepts without restating them.
+        Assume reader has already read depth 1.
+        Reference depth 1 concepts but immediately go deeper.
+    
+    examples:
+      good:
+        - "Provides mathematical formulation of concepts from depth 1"
+        - "Shows step-by-step how mechanisms work"
+        - "Adds precision and rigor to depth 1 intuitions"
+      bad:
+        - "Repeats definitions from depth 1"
+        - "Re-explains concepts already covered"
+        - "Doesn't add new information"
+
+  depth_3:
+    universal_purpose: "Explore and critique UNKNOWNS"
+    question_pattern: "What don't we know about {topic}? What are the open problems?"
+    information_density: "high"
+    abstraction_level: "research_level"
+    
+    constraints:
+      min_paragraphs: 5
+      focus: "open_problems_and_frontiers"
+      avoid: "introductory_or_basic_material"
+    
+    context_usage:
+      previous_depths: [1, 2]
+      instructions: |
+        ASSUME reader has read depths 1 and 2.
+        DO NOT restate material from previous depths.
+        Focus on what is NOT known, controversies, and cutting-edge research.
+        Critically evaluate or extend previous depths.
+    
+    examples:
+      good:
+        - "Identifies specific open problems in the field"
+        - "Discusses competing theoretical frameworks"
+        - "Cites recent research papers (last 3 years)"
+        - "Points out limitations of current understanding"
+      bad:
+        - "Repeats formalism from depth 2"
+        - "Re-introduces concepts from depth 1"
+        - "Provides overview rather than frontier content"

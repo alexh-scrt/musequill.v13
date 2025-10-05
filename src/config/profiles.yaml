@@ -1,0 +1,134 @@
+profiles:
+  scientific:
+    name: "Scientific"
+    description: "Rigorous, technical content for researchers and scientists"
+    target_audience: "PhD-level researchers, scientists, academics"
+    
+    depth_1:
+      purpose: "Establish formal framework and definitions"
+      tone: "formal, precise, technical"
+      required_elements:
+        - formal_definitions
+        - mathematical_notation
+        - key_equations
+      forbidden_elements:
+        - oversimplified_analogies
+        - pop_culture_references
+      min_citations: 2
+      min_equations: 1
+      complexity_level: "advanced"
+      
+    depth_2:
+      purpose: "Present detailed derivations and proofs"
+      tone: "rigorous, proof-oriented"
+      required_elements:
+        - mathematical_derivations
+        - formal_proofs
+        - technical_citations
+      forbidden_elements:
+        - hand_waving
+        - intuition_without_formalism
+      min_citations: 3
+      min_equations: 3
+      complexity_level: "expert"
+      
+    depth_3:
+      purpose: "Discuss open problems and research frontiers"
+      tone: "research-level, critical"
+      required_elements:
+        - recent_papers
+        - open_problems
+        - controversies
+        - unknowns
+      forbidden_elements:
+        - basic_definitions
+        - introductory_material
+      min_citations: 5
+      min_recent_citations: 3  # Papers from last 3 years
+      complexity_level: "cutting_edge"
+
+  popular_science:
+    name: "Popular Science"
+    description: "Accessible, engaging content for science enthusiasts"
+    target_audience: "Educated general public, science enthusiasts"
+    
+    depth_1:
+      purpose: "Explain the big idea and why it matters"
+      tone: "engaging, accessible, conversational"
+      required_elements:
+        - real_world_analogies
+        - concrete_examples
+        - why_it_matters
+      forbidden_elements:
+        - unexplained_jargon
+        - raw_equations
+        - technical_formalism
+      max_equations: 0
+      require_analogies: true
+      complexity_level: "accessible"
+      
+    depth_2:
+      purpose: "Show how it works with intuitive explanations"
+      tone: "clear, illustrative, engaging"
+      required_elements:
+        - step_by_step_explanation
+        - visual_descriptions
+        - simplified_mathematics
+      forbidden_elements:
+        - formal_proofs
+        - unexplained_notation
+      max_equations: 2  # Only if well-explained
+      require_examples: true
+      complexity_level: "intermediate"
+      
+    depth_3:
+      purpose: "Explore what scientists are discovering"
+      tone: "exciting, forward-looking"
+      required_elements:
+        - current_research
+        - future_implications
+        - open_questions
+      forbidden_elements:
+        - technical_derivations
+        - dense_formalism
+      max_equations: 1
+      focus: "implications_and_discoveries"
+      complexity_level: "advanced_accessible"
+
+  educational:
+    name: "Educational"
+    description: "Progressive learning content with examples and exercises"
+    target_audience: "Students, learners at various levels"
+    
+    depth_1:
+      purpose: "Build intuition and foundational understanding"
+      tone: "friendly, instructional, clear"
+      required_elements:
+        - learning_objectives
+        - conceptual_explanation
+        - simple_examples
+      min_examples: 2
+      require_learning_objectives: true
+      complexity_level: "beginner"
+      
+    depth_2:
+      purpose: "Develop problem-solving skills"
+      tone: "instructional, practice-oriented"
+      required_elements:
+        - worked_examples
+        - step_by_step_solutions
+        - practice_problems
+      min_worked_examples: 2
+      min_practice_problems: 3
+      complexity_level: "intermediate"
+      
+    depth_3:
+      purpose: "Master advanced concepts and applications"
+      tone: "challenging, comprehensive"
+      required_elements:
+        - advanced_problems
+        - connections_to_other_topics
+        - real_world_applications
+      min_advanced_problems: 2
+      require_synthesis: true
+      complexity_level: "advanced"
